@@ -1,0 +1,49 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: web3team
+  namespace: argocd
+spec:
+  sourceRepos:
+    - https://github.com/connect-5ive-takei/k3s.git
+  destinations:
+    - namespace: web3team
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist: []
+  namespaceResourceWhitelist:
+    - group: apps
+      kind: Deployment
+    - group: ""
+      kind: Service
+    - group: ""
+      kind: ConfigMap
+    - group: networking.k8s.io
+      kind: Ingress
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: web3team
+  namespace: argocd
+spec:
+  project: web3team
+  source:
+    repoURL: https://github.com/connect-5ive-takei/k3s.git
+    targetRevision: main
+    # k3s/ の中身を専用リポジトリのルートに置いた場合のパス。
+    path: overlays/production
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: web3team
+  syncPolicy:
+    automated:
+      enabled: false
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    retry:
+      limit: 3
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 1m

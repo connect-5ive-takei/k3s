@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: web3team
+resources:
+  - ../../base
+  - ingress.yaml
+images:
+  - name: frontend-image
+    newName: ghcr.io/replace-org/frontend
+    newTag: REPLACE_FRONTEND_COMMIT_SHA
+  - name: backend-image
+    newName: ghcr.io/replace-org/backend
+    newTag: REPLACE_BACKEND_COMMIT_SHA
+configMapGenerator:
+  - name: backend-config
+    behavior: merge
+    literals:
+      - APP_URL=https://app.example.invalid
+

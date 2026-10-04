@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+secrets/*
+!secrets/.gitkeep
+*.pem
+*.key
+*.crt
+kubeconfig*
+rendered*.yaml
+

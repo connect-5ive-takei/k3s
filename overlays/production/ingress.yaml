@@ -1,0 +1,34 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web3team
+  annotations:
+    # k3s 標準の Traefik で HTTPS の入口だけにルートを登録する。
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - app.example.invalid
+      secretName: web3team-tls
+  rules:
+    - host: app.example.invalid
+      http:
+        paths:
+          # /api は削除せず Laravel に渡す。Next.js の API Route と競合させない。
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  name: http
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  name: http
+
