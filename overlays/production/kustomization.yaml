@@ -6,14 +6,15 @@ resources:
   - ingress.yaml
 images:
   - name: frontend-image
-    newName: ghcr.io/replace-org/frontend
-    newTag: REPLACE_FRONTEND_COMMIT_SHA
+    newName: 255229736336.dkr.ecr.ap-southeast-2.amazonaws.com/connect5ive/frontend
+    newTag: bootstrap-20261011-074753
   - name: backend-image
-    newName: ghcr.io/replace-org/backend
-    newTag: REPLACE_BACKEND_COMMIT_SHA
+    newName: 255229736336.dkr.ecr.ap-southeast-2.amazonaws.com/connect5ive/backend
+    newTag: bootstrap-20261011-074753
 configMapGenerator:
   - name: backend-config
     behavior: merge
     literals:
-      - APP_URL=https://app.example.invalid
-
+      # 独自ドメイン取得までの初回確認用。EC2 の再起動でパブリック IP が変わったら更新する。
+      - APP_URL=http://15.135.220.88
+      - SESSION_SECURE_COOKIE=false

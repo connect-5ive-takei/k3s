@@ -21,6 +21,8 @@ spec:
         app.kubernetes.io/part-of: web3team
     spec:
       automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: registry-credentials
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
@@ -70,4 +72,3 @@ spec:
               port: http
             periodSeconds: 20
             timeoutSeconds: 3
-

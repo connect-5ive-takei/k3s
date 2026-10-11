@@ -3,7 +3,8 @@
 frontend / backend / k3s の3リポジトリで管理するための雛形です。AWS の
 `ap-southeast-2` にある既存 EC2 の k3s を対象にします。
 このフォルダの作成だけでは、AWS へのデプロイや GitHub 自動デプロイは実行されません。
-アプリのソース、Dockerfile、DB、TLS 証明書、Argo CD は別途用意します。
+現在は独自ドメイン取得前の初回確認用として、EC2 のパブリック IP へ HTTP で公開します。
+この状態では実ユーザーの認証情報を扱わず、独自ドメイン取得後に HTTPS へ切り替えてください。
 
 ## 構成
 
@@ -14,15 +15,15 @@ k3s/
 │   ├── frontend/                  # Next.js の Deployment / Service
 │   ├── backend/                   # Laravel の Deployment / Service
 │   └── kustomization.yaml         # 共通環境変数（秘密情報を除く）
-├── overlays/production/           # イメージのバージョンと HTTPS 公開設定
-├── gitops/argocd.yaml.example     # 任意：Argo CD の監視設定
+├── overlays/production/           # イメージのバージョンと公開設定
+├── gitops/argocd.yaml             # 任意：Argo CD の監視設定
 ├── .env.example                  # Laravel Secret の入力例
 └── secrets/                      # Git 管理対象外のローカル入力
 ```
 
 ```text
-https://アプリのドメイン/       → Traefik → frontend:3000（Next.js）
-https://アプリのドメイン/api/*  → Traefik → backend:8080（Laravel）
+http://15.135.220.88/       → Traefik → frontend:3000（Next.js）
+http://15.135.220.88/api/*  → Traefik → backend:8080（Laravel）
 Next.js のサーバー処理          → http://backend:8080/api/*
 ```
 
@@ -43,11 +44,10 @@ Apple Silicon の Mac でビルドするときも `--platform linux/amd64` を�
 - `0.0.0.0:3000` で HTTP を待ち受ける。起動コマンドはイメージの CMD / ENTRYPOINT に持たせる。
 - UID/GID `10001:10001` で起動できること。既存イメージが別 UID なら Deployment の数値を合わせる。
 - キャッシュ等、実行時に書くディレクトリをその UID が書き込めるようにする。
-- App Router の `app/healthz/route.ts`（src 構成なら `src/app/healthz/route.ts`）に以下を追加する。
+- App Router の `app/healthz/route.ts`（src 構成なら `src/app/healthz/route.ts`）に、
+  認証や外部サービスに依存しないヘルスチェックを追加する。
 
 ```ts
-export const dynamic = 'force-dynamic';
-
 export function GET() {
   return Response.json({ status: 'ok' });
 }
@@ -90,17 +90,18 @@ DB は到達可能な既存 DB を設定してください。Pod 内の SQLite �
 Sanctum の SPA 認証を使う場合は `/sanctum/csrf-cookie`、ログイン等の公開ルートと
 cookie / CSRF 設定をアプリに合わせて追加してください。この雛形では認証方式を確定しません。
 
-## 2. イメージ名とドメインを設定する
+## 2. イメージ名と公開 URL を設定する
 
-`overlays/production/kustomization.yaml` の以下を変更します。
+`overlays/production/kustomization.yaml` には現在、次を設定しています。
 
-- `ghcr.io/replace-org/frontend` と `ghcr.io/replace-org/backend` → 実際のイメージ名
-- `REPLACE_FRONTEND_COMMIT_SHA` と `REPLACE_BACKEND_COMMIT_SHA` → push 済みタグ
-- `APP_URL=https://app.example.invalid` → 本番 URL
+- frontend / backend の Amazon ECR リポジトリ
+- push 済みの固定タグ `bootstrap-20261011-074753`
+- 一時公開 URL `http://15.135.220.88`
+- HTTP での初回確認用 `SESSION_SECURE_COOKIE=false`
 
-`overlays/production/ingress.yaml` の `app.example.invalid` も **2箇所**とも変更します。
-GHCR は例です。ECR を使う場合も名前は置換できますが、k3s の ECR 認証設定が別途必要です。
-ECR のログイントークンは期限付きなので、固定 Secret の一度の作成で永続運用しないでください。
+EC2 を停止してから再起動すると、Elastic IP を割り当てていないパブリック IP は変わる可能性があります。
+変わった場合は `APP_URL` を更新して再適用します。独自ドメイン取得後は Ingress にホスト名と
+TLS を設定し、`APP_URL=https://...` と `SESSION_SECURE_COOKIE=true` に戻します。
 
 ## 3. ローカルで YAML を生成して確認する
 
@@ -138,20 +139,23 @@ kubectl -n web3team create secret generic backend-secrets \
 Secret を後から変更した場合は、適用後に `kubectl -n web3team rollout restart deployment/backend`
 で環境変数を再読込します。Kubernetes Secret は保存時の暗号化と RBAC を別途管理してください。
 
-非公開イメージの場合は、両 Deployment の `spec.template.spec.imagePullSecrets` に
-`- name: registry-credentials` を追加し、同じ名前空間に読み取り用 Secret を事前に作成します。
-GHCR なら対象 package の読み取りに限定した認証を使い、Docker 設定ファイルを安全に用意します。
+両 Deployment は `registry-credentials` を参照します。EC2 に設定した最小権限のIAMロールから
+ECRトークンを取得し、同じ名前空間のSecretをデプロイ前に更新します。トークンは期限付きのため、
+新しいイメージをデプロイするときは毎回次をEC2上で実行します。
 
 ```bash
-kubectl -n web3team create secret generic registry-credentials \
-  --type=kubernetes.io/dockerconfigjson \
-  --from-file=.dockerconfigjson=secrets/docker-config.json \
-  --dry-run=client -o yaml | kubectl apply -f -
+ecr_password="$(aws ecr get-login-password --region ap-southeast-2)"
+sudo k3s kubectl -n web3team create secret docker-registry registry-credentials \
+  --docker-server=255229736336.dkr.ecr.ap-southeast-2.amazonaws.com \
+  --docker-username=AWS \
+  --docker-password="$ecr_password" \
+  --dry-run=client -o yaml | sudo k3s kubectl apply -f -
+unset ecr_password
 ```
 
-認証情報のあるファイルは `secrets/` に置きます。公開イメージならこの設定は不要です。
+トークンをログやファイルへ出力しないでください。
 
-## 5. HTTPS 公開を準備する
+## 5. 公開設定を確認する
 
 k3s 標準の Traefik が稼働していることを確認します。
 
@@ -159,10 +163,14 @@ k3s 標準の Traefik が稼働していることを確認します。
 kubectl -n kube-system get deployment traefik
 ```
 
-DNS の A レコードを EC2 の到達可能な固定 IP に向け、必要な接続元から TCP 443 を許可します。
+現在の初回確認構成では、セキュリティグループの TCP 80 を公開し、ホスト名なしの Ingress を
+`web` エントリーポイントで受け付けます。通信は暗号化されません。
+
+独自ドメイン取得後は、DNS の A レコードを EC2 の到達可能な固定 IP に向け、必要な接続元から
+TCP 443 を許可します。
 固定 IP を含む AWS リソースには料金が発生する場合があります。6443番や8472番を全世界に開放しません。
-この Ingress は `websecure` のみを使用し、HTTP→HTTPS リダイレクトや証明書の自動発行は含みません。
-ドメインに対応する有効な証明書と秘密鍵を用意し、次を実行します。
+HTTPS へ切り替える際は Ingress を `websecure` に変更します。HTTP→HTTPS リダイレクトや
+証明書の自動発行は別途設定し、ドメインに対応する有効な証明書と秘密鍵を用意します。
 
 ```bash
 kubectl -n web3team create secret tls web3team-tls \
@@ -174,7 +182,7 @@ kubectl -n web3team create secret tls web3team-tls \
 
 ## 6. 初回デプロイ
 
-イメージ・DB・Secret・ドメイン・TLS を準備した後、接続先を確認して適用します。
+イメージ・DB・Secret・公開 URL を準備した後、接続先を確認して適用します。
 
 ```bash
 kubectl config current-context
@@ -222,7 +230,7 @@ probe エラーは `/healthz`・`/up` と待受ポート、`Pending` は空き�
 最新 main を取得して対象タグだけ編集し、競合時に再試行して相手の変更を上書きしないようにします。
 branch protection がある場合は PR 経由で反映する設定に合わせます。
 
-Argo CD 導入済みなら `gitops/argocd.yaml.example` の GitHub URL を2箇所置換して使えます。
+Argo CD 導入済みなら `gitops/argocd.yaml` の GitHub URL を2箇所置換して使えます。
 `k3s/` の中身を専用リポジトリのルートに置くと `path: overlays/production`、この親フォルダを
 そのままリポジトリにするなら `path: k3s/overlays/production` に変更します。
 private リポジトリは Argo CD に読み取り認証を別途登録します。
