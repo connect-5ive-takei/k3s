@@ -19,6 +19,10 @@ spec:
       kind: ConfigMap
     - group: networking.k8s.io
       kind: Ingress
+    - group: cert-manager.io
+      kind: Issuer
+    - group: traefik.io
+      kind: Middleware
 ---
 apiVersion: argoproj.io/v1alpha1
 kind: Application

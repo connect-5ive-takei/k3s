@@ -3,12 +3,18 @@ kind: Ingress
 metadata:
   name: web3team
   annotations:
-    # 独自ドメイン取得までは、k3s 標準の Traefik で HTTP を受け付ける。
-    traefik.ingress.kubernetes.io/router.entrypoints: web
+    cert-manager.io/issuer: letsencrypt-production
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+    traefik.ingress.kubernetes.io/router.middlewares: web3team-redirect-https@kubernetescrd
 spec:
   ingressClassName: traefik
+  tls:
+    - hosts:
+        - __PUBLIC_HOST__
+      secretName: web3team-tls
   rules:
-    - http:
+    - host: __PUBLIC_HOST__
+      http:
         paths:
           # /api は削除せず Laravel に渡す。Next.js の API Route と競合させない。
           - path: /api

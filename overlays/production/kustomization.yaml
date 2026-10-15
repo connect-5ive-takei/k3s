@@ -3,6 +3,8 @@ kind: Kustomization
 namespace: web3team
 resources:
   - ../../base
+  - issuer.yaml
+  - middleware.yaml
   - ingress.yaml
 images:
   - name: frontend-image
@@ -15,6 +17,6 @@ configMapGenerator:
   - name: backend-config
     behavior: merge
     literals:
-      # 独自ドメイン取得までの初回確認用。EC2 の再起動でパブリック IP が変わったら更新する。
-      - APP_URL=http://15.135.220.88
-      - SESSION_SECURE_COOKIE=false
+      - APP_URL=https://__PUBLIC_HOST__
+      - SESSION_SECURE_COOKIE=true
+      - SANCTUM_STATEFUL_DOMAINS=__PUBLIC_HOST__

@@ -2,9 +2,9 @@
 
 frontend / backend / k3s の3リポジトリで管理するための雛形です。AWS の
 `ap-southeast-2` にある既存 EC2 の k3s を対象にします。
-このフォルダの作成だけでは、AWS へのデプロイや GitHub 自動デプロイは実行されません。
-現在は独自ドメイン取得前の初回確認用として、EC2 のパブリック IP へ HTTP で公開します。
-この状態では実ユーザーの認証情報を扱わず、独自ドメイン取得後に HTTPS へ切り替えてください。
+GitHub Actions でテスト、ECR へのイメージ push、k3s への反映まで行います。
+公開 URL は `PUBLIC_HOST` で指定した独自ドメイン（本番は `takajirou.app`）を使用し、cert-manager と Let's Encrypt で
+TLS 証明書を自動取得します。
 
 ## 構成
 
@@ -22,8 +22,8 @@ k3s/
 ```
 
 ```text
-http://15.135.220.88/       → Traefik → frontend:3000（Next.js）
-http://15.135.220.88/api/*  → Traefik → backend:8080（Laravel）
+https://<PUBLIC_HOST>/       → Traefik → frontend:3000（Next.js）
+https://<PUBLIC_HOST>/api/*  → Traefik → backend:8080（Laravel）
 Next.js のサーバー処理          → http://backend:8080/api/*
 ```
 
@@ -95,13 +95,14 @@ cookie / CSRF 設定をアプリに合わせて追加してください。この
 `overlays/production/kustomization.yaml` には現在、次を設定しています。
 
 - frontend / backend の Amazon ECR リポジトリ
-- push 済みの固定タグ `bootstrap-20261011-074753`
-- 一時公開 URL `http://15.135.220.88`
-- HTTP での初回確認用 `SESSION_SECURE_COOKIE=false`
+- push 済みの固定タグ `bootstrap-20261011-074753`（Actions の初回成功後は commit SHA に更新）
+- 公開ホストのプレースホルダー `__PUBLIC_HOST__`
+- HTTPS 用 `SESSION_SECURE_COOKIE=true`
+- Sanctum 用 `SANCTUM_STATEFUL_DOMAINS=__PUBLIC_HOST__`
 
+実際のホスト名は GitHub の `production` Environment 変数 `PUBLIC_HOST` からデプロイ時に注入します。
 EC2 を停止してから再起動すると、Elastic IP を割り当てていないパブリック IP は変わる可能性があります。
-変わった場合は `APP_URL` を更新して再適用します。独自ドメイン取得後は Ingress にホスト名と
-TLS を設定し、`APP_URL=https://...` と `SESSION_SECURE_COOKIE=true` に戻します。
+DNS の A レコードは、再起動後の到達可能な IP または Elastic IP に向けてください。
 
 ## 3. ローカルで YAML を生成して確認する
 
@@ -111,12 +112,12 @@ EC2 上ではこのフォルダを clone / 転送してから実行し、`kubect
 
 ```bash
 kubectl kustomize base
-kubectl kustomize overlays/production
+PUBLIC_HOST=takajirou.app ./scripts/render-production.sh
 ```
 
 生成はクラスタ接続なしでできます。ConfigMap のハッシュが Pod の参照先に入るため、
 環境変数を Git で変更したときも新しい Pod に更新されます。
-生成結果に `REPLACE_`、`replace-org`、`example.invalid` が残ったまま適用しないでください。
+生成結果に `REPLACE_` または `__PUBLIC_HOST__` が残ったまま適用しないでください。
 
 ## 4. 名前空間・秘密情報を準備する
 
@@ -163,22 +164,29 @@ k3s 標準の Traefik が稼働していることを確認します。
 kubectl -n kube-system get deployment traefik
 ```
 
-現在の初回確認構成では、セキュリティグループの TCP 80 を公開し、ホスト名なしの Ingress を
-`web` エントリーポイントで受け付けます。通信は暗号化されません。
+DNS の A レコードを EC2 の到達可能な IP に向け、セキュリティグループの TCP 80 / 443 を
+インターネットから許可します。TCP 80 は Let's Encrypt の HTTP-01 検証と HTTPS リダイレクトに必要です。
+6443番や8472番を全世界に開放しません。SSHを使わず、デプロイ操作はSystems Manager経由で行います。
 
-独自ドメイン取得後は、DNS の A レコードを EC2 の到達可能な固定 IP に向け、必要な接続元から
-TCP 443 を許可します。
-固定 IP を含む AWS リソースには料金が発生する場合があります。6443番や8472番を全世界に開放しません。
-HTTPS へ切り替える際は Ingress を `websecure` に変更します。HTTP→HTTPS リダイレクトや
-証明書の自動発行は別途設定し、ドメインに対応する有効な証明書と秘密鍵を用意します。
+`takajirou.app` の権威DNSは Cloudflare です。EC2 を起動してパブリック IPv4 を確認した後、
+Cloudflare の **DNS → Records → Add record** で次を設定します。
 
-```bash
-kubectl -n web3team create secret tls web3team-tls \
-  --cert=secrets/tls.crt --key=secrets/tls.key \
-  --dry-run=client -o yaml | kubectl apply -f -
-```
+| 項目 | 値 |
+| --- | --- |
+| Type | `A` |
+| Name | `@` |
+| IPv4 address | k3s EC2 のパブリック IPv4 |
+| Proxy status | 最初は `DNS only`（灰色の雲） |
+| TTL | `Auto` |
 
-証明書の更新も必要です。継続運用では cert-manager 等の自動更新を別途構成してください。
+証明書が `Ready` になり、`https://takajirou.app` を確認した後は Cloudflare Proxy を有効にできます。
+有効にする場合、Cloudflare の **SSL/TLS encryption mode** は `Full (strict)` にし、`Flexible` は使用しません。
+EC2 に Elastic IP がないまま停止・起動するとパブリック IPv4 が変わるため、その都度 A レコードの更新が必要です。
+固定したい場合は Elastic IP を新規割り当てし、料金条件を確認した上で EC2 に関連付けます。
+
+`bootstrap/cert-manager.yaml` は k3s の Helm Controller を使い、cert-manager v1.21.2 を導入します。
+`overlays/production/issuer.yaml` が Let's Encrypt の本番 Issuer を作成し、Ingress から
+`web3team-tls` Secretを自動発行・更新します。
 
 ## 6. 初回デプロイ
 
@@ -216,29 +224,97 @@ kubectl -n web3team logs deployment/frontend --tail=100
 probe エラーは `/healthz`・`/up` と待受ポート、`Pending` は空きリソースを確認します。
 ログを共有するときは秘密情報を除いてください。
 
-## 7. main 更新時の自動デプロイへ接続する
+## 7. GitHub Actions 自動デプロイ
 
-この雛形では GitHub リポジトリ URL が未確定のため、CI と Argo CD は有効化していません。
+### 処理の流れ
 
-1. front / back の GitHub Actions を `push: branches: [main]` で起動する。
-2. テスト後にイメージをビルドし、commit SHA タグでレジストリへ push する。
-3. k3s リポジトリの `overlays/production/kustomization.yaml` の対象アプリのタグだけ更新する。
-4. Argo CD が k3s リポジトリの `main` を監視し、更新された Deployment を反映する。
+1. backend / frontend の `main` 更新でテストを実行する。
+2. GitHub OIDC で短期 AWS 認証情報を取得する。
+3. commit SHA を immutable tag として Docker イメージを ECR に push する。
+4. 1時間で失効する GitHub App installation token で k3s リポジトリへ `repository_dispatch` を送る。
+5. k3s workflow が対象イメージタグを `kustomization.yaml` に記録する。
+6. AWS Systems Manager Run Command で、EC2 上の k3s に manifest を適用する。
+7. rollout、TLS 証明書、`/healthz`、未認証 `/api/user` の401を確認する。
 
-別リポジトリへの更新には通常の `GITHUB_TOKEN` だけでは足りません。k3s リポジトリへの
-必要な権限だけを持つ GitHub App 等を構成します。front / back が同時更新するときは、
-最新 main を取得して対象タグだけ編集し、競合時に再試行して相手の変更を上書きしないようにします。
-branch protection がある場合は PR 経由で反映する設定に合わせます。
+EC2 が停止中の場合、ECR への push とタグ記録までは完了しますが、k3s 適用は失敗します。
+EC2 を起動して SSM が `Online` になった後、k3s リポジトリの `Deploy production` を
+`infrastructure` で再実行してください。Actions は EC2 を自動起動しません。
 
-Argo CD 導入済みなら `gitops/argocd.yaml` の GitHub URL を2箇所置換して使えます。
-`k3s/` の中身を専用リポジトリのルートに置くと `path: overlays/production`、この親フォルダを
-そのままリポジトリにするなら `path: k3s/overlays/production` に変更します。
-private リポジトリは Argo CD に読み取り認証を別途登録します。
+### GitHub Environment
 
-名前空間と Secret は事前に手動作成します。AppProject はこのリポジトリと `web3team` 名前空間、
-必要なリソース種別だけを許可します。Argo CD のインストールや bootstrap を自動適用する設定ではありません。
-自動同期を有効にすると、Git から削除した管理対象を `prune` が削除し、手動変更を `selfHeal` が戻します。
-移行後は Git を設定の基準とし、ロールバックも対象イメージタグの Git revert で行います。
+3リポジトリに `production` Environment を作ります。必要なら required reviewers を設定します。
+
+backend / frontend に設定する値:
+
+| 種類 | 名前 | 値 |
+| --- | --- | --- |
+| Variable | `AWS_ACCOUNT_ID` | `255229736336` |
+| Variable | `AWS_REGION` | `ap-southeast-2` |
+| Variable | `ECR_REPOSITORY` | backendは `connect5ive/backend`、frontendは `connect5ive/frontend` |
+| Variable | `DEPLOY_APP_CLIENT_ID` | 後述のGitHub App Client ID |
+| Secret | `AWS_BUILD_ROLE_ARN` | 対象リポジトリだけを信頼するECR push用IAM Role ARN |
+| Secret | `DEPLOY_APP_PRIVATE_KEY` | 後述のGitHub App秘密鍵 |
+
+k3s に設定する値:
+
+| 種類 | 名前 | 値 |
+| --- | --- | --- |
+| Variable | `AWS_ACCOUNT_ID` | `255229736336` |
+| Variable | `AWS_REGION` | `ap-southeast-2` |
+| Variable | `K3S_INSTANCE_ID` | `i-015929fe168de0c25` |
+| Variable | `PUBLIC_HOST` | `takajirou.app` |
+| Secret | `AWS_DEPLOY_ROLE_ARN` | k3sリポジトリだけを信頼するSSM実行用IAM Role ARN |
+
+k3sリポジトリの **Settings → Actions → General → Workflow permissions** は
+`Read and write permissions` にします。人がmainへ直接コミットする代わりに、デプロイworkflowだけが
+immutable image tagを記録します。
+
+### GitHub App
+
+組織にデプロイ専用GitHub Appを作成し、k3sリポジトリだけへインストールします。
+
+- Repository permission: **Contents: Read and write**
+- Webhook: 無効でよい
+- backend / frontend にはAppの Client IDをVariable、秘密鍵をSecretとして保存
+- Personal Access Tokenは使用しない
+
+### AWS OIDC と最小権限
+
+AWSに `https://token.actions.githubusercontent.com`、audience `sts.amazonaws.com` のOIDC providerを作り、
+backend、frontend、k3sの各リポジトリと `production` Environmentにsubjectを限定したIAM Roleを用意します。
+長期アクセスキーをGitHub Secretsへ保存しません。
+
+各Roleの信頼ポリシーでは `token.actions.githubusercontent.com:aud` を `sts.amazonaws.com` と一致させ、
+`token.actions.githubusercontent.com:sub` をRoleごとに次の1件へ限定します。
+
+- backend: `repo:connect-5ive-takei/backend:environment:production`
+- frontend: `repo:connect-5ive-takei/frontend:environment:production`
+- k3s: `repo:connect-5ive-takei/k3s:environment:production`
+
+build roleには対象ECRリポジトリだけのpush権限と、リソース指定できない
+`ecr:GetAuthorizationToken` だけを許可します。deploy roleには対象EC2への
+`ssm:SendCommand`、`AWS-RunShellScript` document、コマンド結果の取得、
+`ssm:DescribeInstanceInformation` だけを許可します。
+
+現在のAWSアカウントではOrganizationsのSCPによりOIDC providerの参照が明示拒否されます。
+同じSCPが作成も拒否する場合、組織管理者にGitHub OIDC providerと上記Roleの作成を依頼してください。
+この制約を長期アクセスキーで回避しないでください。
+
+### EC2側の前提
+
+- SSM Agentが起動し、Systems ManagerのManaged nodesで `Online` になること
+- EC2 instance profileに `AmazonSSMManagedInstanceCore` 相当の権限があること
+- EC2 instance profileに2つのECRリポジトリへのpull-only権限があること
+- `aws`、`gzip`、`base64`、`sudo k3s kubectl` が使用できること
+- `web3team/backend-secrets` を事前に作成していること
+
+### 手動ロールバック
+
+k3sの `Deploy production` を手動実行し、componentに `backend` または `frontend`、
+image_tagに過去のECR commit SHA tagを指定します。存在しないtagはrolloutで失敗します。
+
+Argo CDへ移行する場合は `gitops/argocd.yaml` を利用できますが、現在の主経路は
+GitHub Actions + Systems Managerです。二重管理を避けるため、Argo CDの自動同期と同時に有効化しません。
 
 ## 参考資料
 
@@ -247,4 +323,7 @@ private リポジトリは Argo CD に読み取り認証を別途登録します
 - [Laravel のデプロイ](https://laravel.com/docs/deployment)
 - [k3s の要件](https://docs.k3s.io/installation/requirements)
 - [k3s の Traefik](https://docs.k3s.io/networking/networking-services)
+- [k3s Helm Controller](https://docs.k3s.io/add-ons/helm)
+- [cert-manager](https://cert-manager.io/docs/installation/)
+- [GitHub Actions OIDC for AWS](https://docs.github.com/actions/deployment/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services)
 - [Argo CD の自動同期](https://argo-cd.readthedocs.io/en/stable/user-guide/auto_sync/)
