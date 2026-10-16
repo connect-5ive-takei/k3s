@@ -30,6 +30,33 @@ spec:
         runAsGroup: 10001
         seccompProfile:
           type: RuntimeDefault
+      initContainers:
+        - name: migrate
+          image: backend-image
+          imagePullPolicy: IfNotPresent
+          workingDir: /app
+          command:
+            - php
+            - artisan
+            - migrate
+            - --force
+            - --no-interaction
+          envFrom:
+            - configMapRef:
+                name: backend-config
+            - secretRef:
+                name: backend-secrets
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 768Mi
       containers:
         - name: backend
           image: backend-image
