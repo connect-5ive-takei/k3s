@@ -240,6 +240,7 @@ jobs:
           api_status="$(curl --silent --show-error \
             --retry 5 --retry-all-errors --retry-delay 3 \
             --connect-timeout 10 --max-time 30 \
+            --header "Accept: application/json" \
             --output /dev/null --write-out '%{http_code}' \
             "https://${PUBLIC_HOST}/api/user")"
 
