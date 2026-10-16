@@ -9,7 +9,7 @@ resources:
 images:
   - name: frontend-image
     newName: 255229736336.dkr.ecr.ap-southeast-2.amazonaws.com/connect5ive/frontend
-    newTag: bootstrap-20261011-074753
+    newTag: f654409f1c551dc09879c18a5d9a63dd68cce74d
   - name: backend-image
     newName: 255229736336.dkr.ecr.ap-southeast-2.amazonaws.com/connect5ive/backend
     newTag: bootstrap-20261011-074753
