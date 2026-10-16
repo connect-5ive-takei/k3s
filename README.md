@@ -16,7 +16,6 @@ k3s/
 │   ├── backend/                   # Laravel の Deployment / Service
 │   └── kustomization.yaml         # 共通環境変数（秘密情報を除く）
 ├── overlays/production/           # イメージのバージョンと公開設定
-├── gitops/argocd.yaml             # 任意：Argo CD の監視設定
 ├── .env.example                  # Laravel Secret の入力例
 └── secrets/                      # Git 管理対象外のローカル入力
 ```
@@ -236,6 +235,11 @@ probe エラーは `/healthz`・`/up` と待受ポート、`Pending` は空き�
 6. AWS Systems Manager Run Command で、EC2 上の k3s に manifest を適用する。
 7. rollout、TLS 証明書、`/healthz`、未認証 `/api/user` の401を確認する。
 
+EC2 起動直後は SSM が `Online` でも k3s API やノードネットワークが準備中の場合があります。
+リモートデプロイスクリプトは k3s API と Node の Ready を待ち、一時的な接続断に対して
+`kubectl apply` を最大6回、10秒間隔で再試行します。アプリ適用前には cert-manager webhook、
+CoreDNS、Traefik の rollout 完了も確認します。
+
 EC2 が停止中の場合、ECR への push とタグ記録までは完了しますが、k3s 適用は失敗します。
 EC2 を起動して SSM が `Online` になった後、k3s リポジトリの `Deploy production` を
 `infrastructure` で再実行してください。Actions は EC2 を自動起動しません。
@@ -313,9 +317,6 @@ build roleには対象ECRリポジトリだけのpush権限と、リソース指
 k3sの `Deploy production` を手動実行し、componentに `backend` または `frontend`、
 image_tagに過去のECR commit SHA tagを指定します。存在しないtagはrolloutで失敗します。
 
-Argo CDへ移行する場合は `gitops/argocd.yaml` を利用できますが、現在の主経路は
-GitHub Actions + Systems Managerです。二重管理を避けるため、Argo CDの自動同期と同時に有効化しません。
-
 ## 参考資料
 
 - [Kustomize](https://kubernetes.io/docs/tasks/manage-kubernetes-objects/kustomization/)
@@ -326,4 +327,3 @@ GitHub Actions + Systems Managerです。二重管理を避けるため、Argo C
 - [k3s Helm Controller](https://docs.k3s.io/add-ons/helm)
 - [cert-manager](https://cert-manager.io/docs/installation/)
 - [GitHub Actions OIDC for AWS](https://docs.github.com/actions/deployment/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services)
-- [Argo CD の自動同期](https://argo-cd.readthedocs.io/en/stable/user-guide/auto_sync/)
