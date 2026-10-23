@@ -23,6 +23,7 @@ k3s/
 ```text
 https://<PUBLIC_HOST>/       → Traefik → frontend:3000（Next.js）
 https://<PUBLIC_HOST>/api/*  → Traefik → backend:8080（Laravel）
+https://<PUBLIC_HOST>/transcribe → Traefik → frontend:3001（Transcribe WebSocket gateway）
 Next.js のサーバー処理          → http://backend:8080/api/*
 ```
 
@@ -309,6 +310,10 @@ build roleには対象ECRリポジトリだけのpush権限と、リソース指
 - SSM Agentが起動し、Systems ManagerのManaged nodesで `Online` になること
 - EC2 instance profileに `AmazonSSMManagedInstanceCore` 相当の権限があること
 - EC2 instance profileに2つのECRリポジトリへのpull-only権限があること
+- Transcribeを使う場合、EC2 instance profileに `transcribe:StartStreamTranscription` があり、
+  OrganizationsのSCPでも許可されていること
+- Podからinstance profileを使う構成ではIMDSv2のホップ上限2が必要。これは同一ノード上のPodから
+  instance profileへ到達できる範囲を広げるため、ノードを信頼境界として扱い、不要なPodを配置しないこと
 - `aws`、`gzip`、`base64`、`sudo k3s kubectl` が使用できること
 - `web3team/backend-secrets` を事前に作成していること
 

@@ -10,4 +10,7 @@ spec:
     - name: http
       port: 3000
       targetPort: http
+    - name: transcribe
+      port: 3001
+      targetPort: transcribe
 

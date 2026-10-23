@@ -14,6 +14,10 @@ images:
     newName: 255229736336.dkr.ecr.ap-southeast-2.amazonaws.com/connect5ive/backend
     newTag: bootstrap-20261011-074753
 configMapGenerator:
+  - name: frontend-config
+    behavior: merge
+    literals:
+      - TRANSCRIBE_ALLOWED_ORIGINS=https://__PUBLIC_HOST__
   - name: backend-config
     behavior: merge
     literals:

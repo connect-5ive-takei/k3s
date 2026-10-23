@@ -13,6 +13,12 @@ configMapGenerator:
       - PORT=3000
       - HOSTNAME=0.0.0.0
       - BACKEND_INTERNAL_URL=http://backend:8080
+      - AWS_REGION=ap-southeast-2
+      - TRANSCRIBE_GATEWAY_PORT=3001
+      - TRANSCRIBE_LANGUAGE_CODE=ja-JP
+      - TRANSCRIBE_SAMPLE_RATE=16000
+      - TRANSCRIBE_MAX_SESSION_SECONDS=300
+      - TRANSCRIBE_MAX_CONNECTIONS=20
   - name: backend-config
     literals:
       - APP_ENV=production
