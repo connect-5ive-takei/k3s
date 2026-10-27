@@ -1,5 +1,9 @@
 # Next.js + Laravel の k3s デプロイ設定
 
+> 2026-10-27: Web画面と文字起こし経路は、EC2を停止しても利用できるサーバーレス構成を並行稼働中です。
+> 構成、影響、デプロイ、ロールバックは [docs/serverless-migration.md](docs/serverless-migration.md) を参照してください。
+> 既存k3sマニフェストはロールバック用に維持しています。
+
 frontend / backend / k3s の3リポジトリで管理するための雛形です。AWS の
 `ap-southeast-2` にある既存 EC2 の k3s を対象にします。
 GitHub Actions でテスト、ECR へのイメージ push、k3s への反映まで行います。
