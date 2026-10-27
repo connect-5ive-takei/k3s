@@ -8,4 +8,5 @@ secrets/*
 *.crt
 kubeconfig*
 rendered*.yaml
+serverless/functions/session-broker/node_modules/
 
