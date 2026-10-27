@@ -518,7 +518,7 @@ Outputs:
     Description: Distribution to invalidate after publishing a static release
     Value: !Ref WebDistribution
   CloudFrontDomainName:
-    Description: CloudFront hostname to use before the custom DNS cutover
+    Description: AWS-managed CloudFront hostname for direct diagnostics
     Value: !GetAtt WebDistribution.DomainName
   SiteUrl:
     Description: Public application URL

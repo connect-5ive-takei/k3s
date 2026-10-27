@@ -126,8 +126,6 @@ echo "Publishing the static export to the private site bucket."
 aws s3 sync "${frontend_root}/out/" "s3://${site_bucket}/" \
   --region "$aws_region" \
   --delete \
-  --exclude "*.html" \
-  --exclude "healthz" \
   --cache-control "public,max-age=300"
 aws s3 cp "${frontend_root}/out/" "s3://${site_bucket}/" \
   --region "$aws_region" \

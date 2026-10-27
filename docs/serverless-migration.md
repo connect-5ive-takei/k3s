@@ -9,12 +9,12 @@ Web画面とリアルタイム文字起こしの入口を、EC2/k3sの常時稼�
 
 公開確認用URL:
 
+- `https://takajirou.app`
+- ヘルスチェック: `https://takajirou.app/healthz`
 - `https://d1f7tqilrla6q1.cloudfront.net`
-- ヘルスチェック: `https://d1f7tqilrla6q1.cloudfront.net/healthz`
 
-`takajirou.app` のDNSはまだ切り替えていない。カスタムドメインを使うには、us-east-1のACM証明書を
-Cloudflare DNSで検証した後、CloudFormationへ証明書ARNとドメインを渡し、Cloudflareのレコードを
-CloudFrontへ向ける。
+`takajirou.app` はus-east-1のACM証明書をCloudFrontへ設定し、Cloudflare DNSからCloudFrontへ
+向けている。AWS管理のCloudFrontホスト名は、DNS障害時の切り分けと直接確認用に残す。
 
 ## アーキテクチャ
 
@@ -48,6 +48,10 @@ CloudFormationスタック:
   - CloudFront―Lambda間の検証値を生成するSecrets Manager Secret
   - Lambda実行ロール、ブラウザ用Transcribe限定ロール
   - CloudWatch Logs（14日保持）
+- `connect5ive-serverless-frontend-deploy-policy`
+  - frontendのproduction環境だけを信頼するGitHub Actions OIDCロール
+  - 対象スタックの出力参照、静的サイトS3への同期、対象CloudFrontのinvalidationだけを許可
+  - 誤削除を避けるためスタックのTermination Protectionを有効化
 
 主要設定:
 
