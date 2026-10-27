@@ -1,0 +1,529 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Connect5ive always-on web application — serves a static Next.js export through
+  CloudFront and vends tightly scoped Transcribe sessions only when requested
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+  com.aws.cloudformation.Context:
+    arch: browser -> CloudFront -> private S3; /api/transcribe-session -> HTTP API -> on-demand Lambda; browser -> Transcribe WebSocket
+    must:
+      - Static origin stays private behind CloudFront OAC
+      - Transcribe credentials are IP/time scoped and never cached
+      - No NAT, load balancer, RDS, or provisioned concurrency fixed cost
+
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  RateLimitPerHour:
+    Type: Number
+    Default: 6
+    MinValue: 1
+    MaxValue: 60
+    Description: Maximum credential grants per viewer IP and UTC hour
+  CustomDomainName:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
+    Description: Optional CloudFront alias; requires a us-east-1 ACM certificate
+  CloudFrontCertificateArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^arn:aws:acm:us-east-1:[0-9]{12}:certificate/[0-9a-f-]+$"
+    Description: Optional us-east-1 ACM certificate ARN for CustomDomainName
+
+Conditions:
+  UseCustomDomain: !And
+    - !Not [!Equals [!Ref CustomDomainName, ""]]
+    - !Not [!Equals [!Ref CloudFrontCertificateArn, ""]]
+
+Resources:
+  OriginVerificationSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: CloudFront-only origin proof generated and resolved server-side; avoids plaintext deployment parameters
+        must:
+          - never expose value to browser, logs, outputs, or repository
+        mutable: review-required
+    Properties:
+      Description: !Sub "${AWS::StackName} CloudFront origin verification value"
+      GenerateSecretString:
+        ExcludePunctuation: true
+        PasswordLength: 64
+
+  StaticSiteBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: hosts immutable static export; S3 over Next server removes idle compute cost
+        must:
+          - block all public access; reads only through distribution OAC
+          - versioning remains enabled for rollback after sync --delete
+        mutable: change-with-constraints
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireNoncurrentSiteVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  StaticSiteOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: signs CloudFront-to-S3 requests; replaces public website hosting/OAI
+        must:
+          - signing behavior stays always
+    Properties:
+      OriginAccessControlConfig:
+        Description: !Sub "${AWS::StackName} private S3 origin"
+        Name: !Sub "${AWS::StackName}-s3-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  StaticCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Comment: Cache static assets without forwarding viewer state
+        DefaultTTL: 300
+        MaxTTL: 31536000
+        MinTTL: 0
+        Name: !Sub "${AWS::StackName}-static"
+        ParametersInCacheKeyAndForwardedToOrigin:
+          CookiesConfig:
+            CookieBehavior: none
+          EnableAcceptEncodingBrotli: true
+          EnableAcceptEncodingGzip: true
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
+  ApiNoCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Comment: Never cache temporary Transcribe credentials
+        DefaultTTL: 0
+        MaxTTL: 0
+        MinTTL: 0
+        Name: !Sub "${AWS::StackName}-api-no-cache"
+        ParametersInCacheKeyAndForwardedToOrigin:
+          CookiesConfig:
+            CookieBehavior: none
+          EnableAcceptEncodingBrotli: false
+          EnableAcceptEncodingGzip: false
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
+  ApiOriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Comment: Forward only the CloudFront-derived viewer address
+        CookiesConfig:
+          CookieBehavior: none
+        HeadersConfig:
+          HeaderBehavior: whitelist
+          Headers:
+            - CloudFront-Viewer-Address
+        Name: !Sub "${AWS::StackName}-api-origin"
+        QueryStringsConfig:
+          QueryStringBehavior: none
+
+  SecurityHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Comment: Browser security headers for the static application
+        Name: !Sub "${AWS::StackName}-security"
+        SecurityHeadersConfig:
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: strict-origin-when-cross-origin
+            Override: true
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: true
+            Override: true
+          XSSProtection:
+            ModeBlock: true
+            Protection: true
+            Override: true
+
+  StaticRouteRewriteFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      AutoPublish: true
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var uri = request.uri;
+          if (uri === '/healthz') {
+            return request;
+          }
+          if (uri.endsWith('/')) {
+            request.uri = uri + 'index.html';
+          } else if (!uri.split('/').pop().includes('.')) {
+            request.uri = uri + '/index.html';
+          }
+          return request;
+        }
+      FunctionConfig:
+        Comment: Map extensionless Next.js routes to exported index.html files
+        Runtime: cloudfront-js-2.0
+      Name: !Sub "${AWS::StackName}-route-rewrite"
+
+  TranscriptionRateLimitTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: fixed-window abuse guard for credential grants; stores only SHA-256 client hash & auto-expires after 2h
+        must:
+          - TTL stays enabled; no raw viewer IP stored
+        mutable: change-with-constraints
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: clientWindow
+          AttributeType: S
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+        - AttributeName: clientWindow
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  TranscribeSessionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: isolated browser role assumed for 15m; session policy further limits source IP and new-stream deadline to 60s
+        must:
+          - only session-broker execution role may assume
+          - only StartStreamTranscription allowed
+        mutable: review-required
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt SessionBrokerExecutionRole.Arn
+            Action: sts:AssumeRole
+      MaxSessionDuration: 3600
+      Policies:
+        - PolicyName: StartStreamingTranscription
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: transcribe:StartStreamTranscription
+                Resource: "*"
+
+  SessionBrokerExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: least-privilege broker role; writes rate counter, assumes isolated browser role, emits retained logs
+        must:
+          - no direct Transcribe permission
+        mutable: review-required
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SessionBrokerRuntime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteFunctionLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${SessionBrokerLogGroup.Arn}:*"
+              - Sid: ConsumeRateLimit
+                Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource: !GetAtt TranscriptionRateLimitTable.Arn
+
+  SessionBrokerAssumeRolePolicy:
+    Type: AWS::IAM::Policy
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: attaches assume-role permission after both roles exist; separate resource avoids circular trust dependency
+        must:
+          - scope Resource to TranscribeSessionRole only
+    Properties:
+      PolicyName: AssumeTranscribeSessionRole
+      Roles:
+        - !Ref SessionBrokerExecutionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Resource: !GetAtt TranscribeSessionRole.Arn
+
+  SessionBrokerFunction:
+    Type: AWS::Serverless::Function
+    DependsOn:
+      - SessionBrokerAssumeRolePolicy
+      - SessionBrokerLogGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: synchronous on-demand credential broker; Lambda over resident API server because requests are sparse
+        must:
+          - no VPC/NAT; timeout 10s; API Gateway caps broker request rate
+          - origin secret & rate limit required before STS grant
+        mutable: change-with-constraints
+    Properties:
+      Architectures:
+        - arm64
+      CodeUri: functions/session-broker/
+      Environment:
+        Variables:
+          MAX_SESSION_SECONDS: "300"
+          ORIGIN_SECRET: !Sub "{{resolve:secretsmanager:${OriginVerificationSecret}:SecretString}}"
+          RATE_LIMIT_PER_HOUR: !Ref RateLimitPerHour
+          RATE_LIMIT_TABLE: !Ref TranscriptionRateLimitTable
+          TRANSCRIBE_LANGUAGE_CODE: ja-JP
+          TRANSCRIBE_SAMPLE_RATE: "16000"
+          TRANSCRIBE_SESSION_ROLE_ARN: !GetAtt TranscribeSessionRole.Arn
+      FunctionName: !Sub "${AWS::StackName}-session-broker"
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt SessionBrokerExecutionRole.Arn
+      Runtime: nodejs22.x
+      Timeout: 10
+
+  SessionBrokerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-session-broker"
+      RetentionInDays: 14
+
+  TranscriptionApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Description: CloudFront-only session broker API
+      DisableExecuteApiEndpoint: false
+      Name: !Sub "${AWS::StackName}-http"
+      ProtocolType: HTTP
+
+  TranscriptionApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref TranscriptionApi
+      IntegrationMethod: POST
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt SessionBrokerFunction.Arn
+      PayloadFormatVersion: "2.0"
+      TimeoutInMillis: 10000
+
+  TranscriptionApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref TranscriptionApi
+      AuthorizationType: NONE
+      RouteKey: POST /api/transcribe-session
+      Target: !Sub "integrations/${TranscriptionApiIntegration}"
+
+  TranscriptionApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref TranscriptionApi
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 2
+        ThrottlingRateLimit: 1
+      StageName: $default
+
+  SessionBrokerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SessionBrokerFunction
+      Principal: apigateway.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${TranscriptionApi}/*/POST/api/transcribe-session"
+
+  WebDistribution:
+    Type: AWS::CloudFront::Distribution
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: always-on HTTPS edge entry point; static cache avoids EC2 while exact API behavior never caches credentials
+        must:
+          - API behavior keeps TTL=0 & origin verification header
+          - static origin uses OAC, not public S3 website
+        mutable: change-with-constraints
+    Properties:
+      DistributionConfig:
+        Aliases: !If
+          - UseCustomDomain
+          - - !Ref CustomDomainName
+          - !Ref AWS::NoValue
+        Comment: Connect5ive static application and transcription session API
+        CustomErrorResponses:
+          - ErrorCachingMinTTL: 0
+            ErrorCode: 403
+            ResponseCode: 404
+            ResponsePagePath: /404.html
+          - ErrorCachingMinTTL: 0
+            ErrorCode: 404
+            ResponseCode: 404
+            ResponsePagePath: /404.html
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachePolicyId: !Ref StaticCachePolicy
+          CachedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          Compress: true
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt StaticRouteRewriteFunction.FunctionARN
+          ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+          TargetOriginId: StaticSiteOrigin
+          ViewerProtocolPolicy: redirect-to-https
+        CacheBehaviors:
+          - PathPattern: /api/transcribe-session
+            AllowedMethods:
+              - DELETE
+              - GET
+              - HEAD
+              - OPTIONS
+              - PATCH
+              - POST
+              - PUT
+            CachePolicyId: !Ref ApiNoCachePolicy
+            CachedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+            Compress: true
+            OriginRequestPolicyId: !Ref ApiOriginRequestPolicy
+            ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+            TargetOriginId: SessionApiOrigin
+            ViewerProtocolPolicy: https-only
+        DefaultRootObject: index.html
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        Origins:
+          - DomainName: !GetAtt StaticSiteBucket.RegionalDomainName
+            Id: StaticSiteOrigin
+            OriginAccessControlId: !Ref StaticSiteOriginAccessControl
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+          - CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginReadTimeout: 10
+              OriginSSLProtocols:
+                - TLSv1.2
+            DomainName: !Sub "${TranscriptionApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}"
+            Id: SessionApiOrigin
+            OriginCustomHeaders:
+              - HeaderName: X-Origin-Verify
+                HeaderValue: !Sub "{{resolve:secretsmanager:${OriginVerificationSecret}:SecretString}}"
+        PriceClass: PriceClass_200
+        ViewerCertificate: !If
+          - UseCustomDomain
+          - AcmCertificateArn: !Ref CloudFrontCertificateArn
+            MinimumProtocolVersion: TLSv1.2_2021
+            SslSupportMethod: sni-only
+          - CloudFrontDefaultCertificate: true
+
+  StaticSiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: allows object reads only from this distribution and denies non-TLS access
+        must:
+          - CloudFront allow remains source-ARN scoped
+          - keep aws:SecureTransport deny
+    Properties:
+      Bucket: !Ref StaticSiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${StaticSiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${WebDistribution}"
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt StaticSiteBucket.Arn
+              - !Sub "${StaticSiteBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+Outputs:
+  StaticSiteBucketName:
+    Description: Private bucket that receives the Next.js out directory
+    Value: !Ref StaticSiteBucket
+  CloudFrontDistributionId:
+    Description: Distribution to invalidate after publishing a static release
+    Value: !Ref WebDistribution
+  CloudFrontDomainName:
+    Description: CloudFront hostname to use before the custom DNS cutover
+    Value: !GetAtt WebDistribution.DomainName
+  SiteUrl:
+    Description: Public application URL
+    Value: !If
+      - UseCustomDomain
+      - !Sub "https://${CustomDomainName}"
+      - !Sub "https://${WebDistribution.DomainName}"
+
