@@ -1,0 +1,106 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Connect5ive frontend deployment role — lets the production GitHub workflow publish
+  only to the serverless site and invalidate its CloudFront distribution
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+  com.aws.cloudformation.Context:
+    arch: frontend production workflow -> dedicated OIDC role -> private S3 + CloudFront
+    must:
+      - Trust only the frontend repository's main branch production environment
+      - Scope writes to the deployed serverless site bucket and distribution
+    ref:
+      - at: docs/serverless-migration.md
+        has: deployment flow + rollback guidance
+        scope: repo
+
+Parameters:
+  ApplicationStackName:
+    Type: String
+    Default: connect5ive-serverless
+    AllowedPattern: "^[A-Za-z][-A-Za-z0-9]{0,127}$"
+  StaticSiteBucketName:
+    Type: String
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+  CloudFrontDistributionId:
+    Type: String
+    AllowedPattern: "^[A-Z0-9]+$"
+
+Resources:
+  FrontendServerlessDeployRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: replaces ECR+k3s publish with static S3 upload + CloudFront refresh; separate from legacy ECR role to preserve purpose-scoped access
+        must:
+          - OIDC aud = sts.amazonaws.com
+          - OIDC sub = frontend production environment and ref = main
+          - No EC2, SSM, ECR, IAM mutation, or broad S3 access
+          - CloudFormation access remains read-only and limited to the application stack
+        mutable: change-with-constraints
+    Properties:
+      RoleName: Connect5iveFrontendServerlessDeployRole
+      Description: GitHub Actions deployment to the Connect5ive serverless frontend
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: GitHubActionsProductionEnvironment
+            Effect: Allow
+            Principal:
+              Federated: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:ref: refs/heads/main
+                token.actions.githubusercontent.com:sub:
+                  - repo:connect-5ive-takei/frontend:environment:production
+                  - repo:connect-5ive-takei@336816162/frontend@1401223559:environment:production
+      Policies:
+        - PolicyName: Connect5iveFrontendServerlessDeploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadServerlessStackOutputs
+                Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ApplicationStackName}/*"
+              - Sid: ReadStaticSiteBucket
+                Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${StaticSiteBucketName}"
+              - Sid: PublishStaticSiteObjects
+                Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${StaticSiteBucketName}/*"
+              - Sid: RefreshCloudFrontDistribution
+                Effect: Allow
+                Action:
+                  - cloudfront:CreateInvalidation
+                  - cloudfront:GetInvalidation
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistributionId}"
+      Tags:
+        - Key: Project
+          Value: Connect5ive
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Repository
+          Value: frontend
+
+Outputs:
+  DeploymentRoleArn:
+    Description: GitHub Actions OIDC role for serverless frontend deployment
+    Value: !GetAtt FrontendServerlessDeployRole.Arn

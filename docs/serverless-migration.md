@@ -95,15 +95,25 @@ npm run build
 - `serverless/tests/`: セッションポリシー、IP解析、レート制限キーのテスト
 - `scripts/deploy-serverless.sh`: ビルド、パッケージ、CloudFormation、S3同期、CloudFront invalidation
 
-既存の `base/`、`overlays/production/`、Traefik、cert-manager、k3s用GitHub Actionsは変更していない。
-そのため既存の自動デプロイは引き続きEC2/k3sを対象にする。サーバーレス側は現在、上記スクリプトによる
-手動デプロイである。
+既存の `base/`、`overlays/production/`、Traefik、cert-managerは変更していない。
+frontendの `main` 更新時はGitHub Actionsが静的ビルド、S3同期、CloudFront invalidation、ヘルスチェックを
+実行する。従来のEC2/k3s用Workflowは自動トリガーを外し、明示的な `workflow_dispatch` による
+手動ロールバック専用とした。LambdaやCloudFormationのインフラ変更は引き続き上記スクリプトで適用する。
+
+GitHub Actionsには `serverless/frontend-deploy-policy.yaml` で専用OIDCロールを作成し、対象の
+CloudFormation出力参照、静的サイトS3への同期、対象CloudFront Distributionのinvalidationだけを許可する。
+従来のECR pushロールは組織SCP上も用途が限定されているため流用せず、EC2、SSM、ECR、IAM変更権限を
+サーバーレス配信ロールへ追加していない。
 
 ## バックエンド変更
 
 LaravelのコードとAWSリソースは変更していない。現行フロントはLaravel APIを使用していないため、
 常時表示と文字起こし機能には影響しない。ただし、将来 `/api/user` 等を新フロントから使う場合は、
 LaravelをLambda対応にするか、別のオンデマンドAPIとして移行する必要がある。
+
+新構成にはLaravelのデプロイ先がないため、backendリポジトリの `main` 更新時はテストだけを実行し、
+ECRへのpushとEC2/k3sへの自動デプロイ要求は停止した。バックエンド機能を再利用する際は、先に
+オンデマンドAPIとしての移行先を設計してから自動デプロイを追加する。
 
 ## 影響と注意事項
 

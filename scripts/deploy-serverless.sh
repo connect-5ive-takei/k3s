@@ -6,8 +6,8 @@ aws_region="${AWS_REGION:-ap-southeast-2}"
 bootstrap_stack="${BOOTSTRAP_STACK_NAME:-connect5ive-serverless-bootstrap}"
 application_stack="${APPLICATION_STACK_NAME:-connect5ive-serverless}"
 rate_limit_per_hour="${RATE_LIMIT_PER_HOUR:-6}"
-custom_domain_name="${CUSTOM_DOMAIN_NAME:-}"
-cloudfront_certificate_arn="${CLOUDFRONT_CERTIFICATE_ARN:-}"
+custom_domain_name="${CUSTOM_DOMAIN_NAME-}"
+cloudfront_certificate_arn="${CLOUDFRONT_CERTIFICATE_ARN-}"
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 frontend_root="$(cd "${repository_root}/../frontend" && pwd)"
 broker_root="${repository_root}/serverless/functions/session-broker"
@@ -24,7 +24,13 @@ if [[ ! "$rate_limit_per_hour" =~ ^[1-9][0-9]*$ ]] || (( rate_limit_per_hour > 6
   exit 64
 fi
 
-if { [[ -n "$custom_domain_name" ]] && [[ -z "$cloudfront_certificate_arn" ]]; } || \
+custom_domain_is_set=false
+certificate_arn_is_set=false
+[[ "${CUSTOM_DOMAIN_NAME+x}" == x ]] && custom_domain_is_set=true
+[[ "${CLOUDFRONT_CERTIFICATE_ARN+x}" == x ]] && certificate_arn_is_set=true
+
+if [[ "$custom_domain_is_set" != "$certificate_arn_is_set" ]] || \
+  { [[ -n "$custom_domain_name" ]] && [[ -z "$cloudfront_certificate_arn" ]]; } || \
   { [[ -z "$custom_domain_name" ]] && [[ -n "$cloudfront_certificate_arn" ]]; }; then
   echo "CUSTOM_DOMAIN_NAME and CLOUDFRONT_CERTIFICATE_ARN must be set together." >&2
   exit 64
@@ -54,6 +60,14 @@ if [[ ! -f "${frontend_root}/out/index.html" ]]; then
 fi
 
 echo "Deploying the private CloudFormation packaging bucket."
+parameter_overrides=("RateLimitPerHour=${rate_limit_per_hour}")
+if [[ "$custom_domain_is_set" == true ]]; then
+  parameter_overrides+=(
+    "CustomDomainName=${custom_domain_name}"
+    "CloudFrontCertificateArn=${cloudfront_certificate_arn}"
+  )
+fi
+
 aws cloudformation deploy \
   --region "$aws_region" \
   --stack-name "$bootstrap_stack" \
@@ -83,10 +97,7 @@ aws cloudformation deploy \
   --stack-name "$application_stack" \
   --template-file "${temporary_directory}/packaged.yaml" \
   --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
-  --parameter-overrides \
-    "RateLimitPerHour=${rate_limit_per_hour}" \
-    "CustomDomainName=${custom_domain_name}" \
-    "CloudFrontCertificateArn=${cloudfront_certificate_arn}" \
+  --parameter-overrides "${parameter_overrides[@]}" \
   --no-fail-on-empty-changeset
 
 read_stack_output() {

@@ -1,16 +1,6 @@
-name: Deploy production
+name: Deploy legacy k3s manually
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/deploy.yml"
-      - "base/**"
-      - "bootstrap/**"
-      - "overlays/production/**"
-      - "scripts/**"
-  repository_dispatch:
-    types: [deploy-image]
   workflow_dispatch:
     inputs:
       component:
@@ -28,12 +18,12 @@ on:
         type: string
 
 concurrency:
-  group: production-k3s
+  group: production-legacy-k3s
   cancel-in-progress: false
 
 jobs:
   deploy:
-    name: Apply manifests through AWS Systems Manager
+    name: Apply legacy manifests through AWS Systems Manager
     runs-on: ubuntu-latest
     timeout-minutes: 25
     environment:
