@@ -10,7 +10,7 @@ Metadata:
     arch: browser -> CloudFront -> private S3; /api/transcribe-session -> HTTP API -> on-demand Lambda; browser -> Transcribe WebSocket
     must:
       - Static origin stays private behind CloudFront OAC
-      - Transcribe credentials are IP/time scoped and never cached
+      - Transcribe credentials are action/time scoped and never cached
       - No NAT, load balancer, RDS, or provisioned concurrency fixed cost
 
 Transform: AWS::Serverless-2016-10-31
@@ -142,13 +142,13 @@ Resources:
     Type: AWS::CloudFront::OriginRequestPolicy
     Properties:
       OriginRequestPolicyConfig:
-        Comment: Forward only the CloudFront-derived viewer address
+        Comment: Forward only the viewer address set by the API edge function
         CookiesConfig:
           CookieBehavior: none
         HeadersConfig:
           HeaderBehavior: whitelist
           Headers:
-            - CloudFront-Viewer-Address
+            - True-Client-IP
         Name: !Sub "${AWS::StackName}-api-origin"
         QueryStringsConfig:
           QueryStringBehavior: none
@@ -200,6 +200,28 @@ Resources:
         Runtime: cloudfront-js-2.0
       Name: !Sub "${AWS::StackName}-route-rewrite"
 
+  ApiViewerAddressFunction:
+    Type: AWS::CloudFront::Function
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: copy the trusted CloudFront viewer IP into the only request header forwarded to the session API
+        must:
+          - overwrite any viewer-supplied true-client-ip value
+          - remain associated only with the session API behavior
+        mutable: change-with-constraints
+    Properties:
+      AutoPublish: true
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          request.headers['true-client-ip'] = { value: event.viewer.ip };
+          return request;
+        }
+      FunctionConfig:
+        Comment: Add the trusted viewer IP for transcription rate limiting
+        Runtime: cloudfront-js-2.0
+      Name: !Sub "${AWS::StackName}-api-viewer-address"
+
   TranscriptionRateLimitTable:
     Type: AWS::DynamoDB::Table
     DeletionPolicy: Delete
@@ -228,10 +250,10 @@ Resources:
     Type: AWS::IAM::Role
     Metadata:
       com.aws.cloudformation.Context:
-        why: isolated browser role assumed for 15m; session policy further limits source IP and new-stream deadline to 60s
+        why: isolated browser role assumed for 15m; session policy allows only HTTP2/WebSocket streams started within 60s
         must:
           - only session-broker execution role may assume
-          - only StartStreamTranscription allowed
+          - only Transcribe streaming start actions allowed
         mutable: review-required
     Properties:
       AssumeRolePolicyDocument:
@@ -248,7 +270,9 @@ Resources:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
-                Action: transcribe:StartStreamTranscription
+                Action:
+                  - transcribe:StartStreamTranscription
+                  - transcribe:StartStreamTranscriptionWebSocket
                 Resource: "*"
 
   SessionBrokerExecutionRole:
@@ -444,6 +468,9 @@ Resources:
               - HEAD
               - OPTIONS
             Compress: true
+            FunctionAssociations:
+              - EventType: viewer-request
+                FunctionARN: !GetAtt ApiViewerAddressFunction.FunctionARN
             OriginRequestPolicyId: !Ref ApiOriginRequestPolicy
             ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
             TargetOriginId: SessionApiOrigin

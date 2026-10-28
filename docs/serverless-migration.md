@@ -40,7 +40,7 @@ CloudFormationスタック:
 - `connect5ive-serverless`
   - 静的サイト用S3バケット
   - CloudFront DistributionとOrigin Access Control
-  - CloudFront FunctionによるNext.js静的ルート変換
+  - CloudFront FunctionによるNext.js静的ルート変換とAPI用クライアントIP設定
   - セキュリティレスポンスヘッダー、静的/API別キャッシュポリシー
   - API Gateway HTTP API
   - セッション発行Lambda
@@ -58,16 +58,20 @@ CloudFormationスタック:
 - Lambda: Node.js 22、arm64、128MB、タイムアウト10秒、オンデマンド
 - API Gateway: 毎秒1リクエスト、バースト2
 - セッション発行: 同一IPにつきUTC 1時間6回まで
+- クライアントIP: API用CloudFront Functionが `event.viewer.ip` から設定し、Lambdaへ転送
 - STS認証情報: 15分で失効
-- Transcribe開始権限: 発行元IPに限定し、新しい接続を開始できる時間は発行後60秒まで
+- Transcribe開始権限: HTTP/2とWebSocketの開始だけを許可し、新しい接続を開始できる時間は発行後60秒まで
 - フロント側文字起こし: 1セッション最大300秒
 - S3: 全パブリックアクセス遮断、AES-256暗号化、TLS必須、CloudFront OAC経由だけ読み取り可能
 - DynamoDB: On-Demand、暗号化有効、レート制限レコードはTTLで約2時間後に削除
 - API Gateway直アクセス: CloudFrontだけが付加する共有ヘッダーがなければ403
 - 共有ヘッダー値: CloudFormationの平文パラメータではなくSecrets Manager動的参照
 
-IAMの `transcribe:StartStreamTranscription` はサービス仕様上Resource ARNへ限定できないためResourceは
-`*` だが、専用ロールにはこの1アクションだけを許可し、STSセッションポリシーでIPと時刻を追加制限する。
+IAMの `transcribe:StartStreamTranscription` と `transcribe:StartStreamTranscriptionWebSocket` は、
+サービス仕様上Resource ARNへ限定できないためResourceは `*` とする。専用ロールとSTSセッション
+ポリシーはこの2アクションだけを許可し、セッションポリシーで新規接続を開始できる期限を追加制限する。
+接続元IPはCloudFrontとTranscribeへの通信経路で異なる場合があるためセッションポリシーでは固定せず、セッション
+発行API側のIPレート制限に利用する。
 
 ## フロントエンド変更
 

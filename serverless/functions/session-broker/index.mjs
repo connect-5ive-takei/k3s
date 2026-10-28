@@ -65,10 +65,9 @@ export function parseViewerAddress(value) {
   return isIP(address) === 4 ? address : null;
 }
 
-export function buildSessionPolicy(sourceIp, validUntil) {
-  const addressVersion = isIP(sourceIp);
-  if (addressVersion === 0) {
-    throw new TypeError("sourceIp must be a valid IP address");
+export function buildSessionPolicy(validUntil) {
+  if (!(validUntil instanceof Date) || Number.isNaN(validUntil.getTime())) {
+    throw new TypeError("validUntil must be a valid Date");
   }
 
   return JSON.stringify({
@@ -76,12 +75,12 @@ export function buildSessionPolicy(sourceIp, validUntil) {
     Statement: [
       {
         Effect: "Allow",
-        Action: "transcribe:StartStreamTranscription",
+        Action: [
+          "transcribe:StartStreamTranscription",
+          "transcribe:StartStreamTranscriptionWebSocket",
+        ],
         Resource: "*",
         Condition: {
-          IpAddress: {
-            "aws:SourceIp": `${sourceIp}/${addressVersion === 4 ? 32 : 128}`,
-          },
           DateLessThan: {
             "aws:CurrentTime": validUntil.toISOString(),
           },
@@ -145,7 +144,7 @@ export async function handler(event, context) {
     return jsonResponse(403, { message: "Forbidden" });
   }
 
-  const sourceIp = parseViewerAddress(headers["cloudfront-viewer-address"]);
+  const sourceIp = parseViewerAddress(headers["true-client-ip"]);
   if (!sourceIp) {
     return jsonResponse(400, { message: "Client address is unavailable" });
   }
@@ -159,7 +158,7 @@ export async function handler(event, context) {
         RoleArn: process.env.TRANSCRIBE_SESSION_ROLE_ARN,
         RoleSessionName: `web-${randomUUID().replaceAll("-", "").slice(0, 24)}`,
         DurationSeconds: 900,
-        Policy: buildSessionPolicy(sourceIp, permissionDeadline),
+        Policy: buildSessionPolicy(permissionDeadline),
       }),
     );
     const credentials = assumedRole.Credentials;
