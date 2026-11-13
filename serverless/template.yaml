@@ -1,13 +1,13 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
   Connect5ive always-on web application — serves a static Next.js export through
-  CloudFront and vends tightly scoped Transcribe sessions only when requested
+  CloudFront and runs transcription session and note analysis APIs only when requested
 
 Metadata:
   AWSToolsMetrics:
     AWSAgentToolkit: aws-cloudformation@3
   com.aws.cloudformation.Context:
-    arch: browser -> CloudFront -> private S3; /api/transcribe-session -> HTTP API -> on-demand Lambda; browser -> Transcribe WebSocket
+    arch: browser -> CloudFront -> private S3; /api/* -> HTTP API -> on-demand Lambdas; browser -> Transcribe WebSocket; note analyzer -> Gemini
     must:
       - Static origin stays private behind CloudFront OAC
       - Transcribe credentials are action/time scoped and never cached
@@ -22,6 +22,12 @@ Parameters:
     MinValue: 1
     MaxValue: 60
     Description: Maximum credential grants per viewer IP and UTC hour
+  AnalysisRateLimitPerHour:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    MaxValue: 100
+    Description: Maximum note analysis requests per viewer IP and UTC hour
   CustomDomainName:
     Type: String
     Default: ""
@@ -54,6 +60,19 @@ Resources:
       GenerateSecretString:
         ExcludePunctuation: true
         PasswordLength: 64
+
+  GeminiApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: stores externally issued Gemini API key; Lambda reads at runtime so key never enters fn config or source
+        must:
+          - populate out-of-band after first deploy; never expose value to logs, outputs, or repository
+        mutable: review-required
+    Properties:
+      Description: !Sub "${AWS::StackName} Gemini API key for note analysis"
 
   StaticSiteBucket:
     Type: AWS::S3::Bucket
@@ -123,7 +142,7 @@ Resources:
     Type: AWS::CloudFront::CachePolicy
     Properties:
       CachePolicyConfig:
-        Comment: Never cache temporary Transcribe credentials
+        Comment: Never cache API responses
         DefaultTTL: 0
         MaxTTL: 0
         MinTTL: 0
@@ -142,7 +161,7 @@ Resources:
     Type: AWS::CloudFront::OriginRequestPolicy
     Properties:
       OriginRequestPolicyConfig:
-        Comment: Forward only the viewer address set by the API edge function
+        Comment: Forward only the trusted viewer address set by the API edge function
         CookiesConfig:
           CookieBehavior: none
         HeadersConfig:
@@ -152,6 +171,28 @@ Resources:
         Name: !Sub "${AWS::StackName}-api-origin"
         QueryStringsConfig:
           QueryStringBehavior: none
+
+  LaravelApiOriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: forwards Laravel authentication and request state while letting CloudFront supply the API Gateway host header
+        must:
+          - never forward the viewer Host header to API Gateway
+          - keep the origin verification value in CloudFront OriginCustomHeaders
+        mutable: change-with-constraints
+    Properties:
+      OriginRequestPolicyConfig:
+        Comment: Forward Laravel API cookies, headers, and query strings except Host
+        CookiesConfig:
+          CookieBehavior: all
+        HeadersConfig:
+          HeaderBehavior: allExcept
+          Headers:
+            - Host
+        Name: !Sub "${AWS::StackName}-laravel-api-origin"
+        QueryStringsConfig:
+          QueryStringBehavior: all
 
   SecurityHeadersPolicy:
     Type: AWS::CloudFront::ResponseHeadersPolicy
@@ -204,10 +245,10 @@ Resources:
     Type: AWS::CloudFront::Function
     Metadata:
       com.aws.cloudformation.Context:
-        why: copy the trusted CloudFront viewer IP into the only request header forwarded to the session API
+        why: copy trusted CloudFront viewer IP into the only request header forwarded to rate-limited APIs
         must:
           - overwrite any viewer-supplied true-client-ip value
-          - remain associated only with the session API behavior
+          - remain associated only with API behaviors
         mutable: change-with-constraints
     Properties:
       AutoPublish: true
@@ -218,7 +259,7 @@ Resources:
           return request;
         }
       FunctionConfig:
-        Comment: Add the trusted viewer IP for transcription rate limiting
+        Comment: Add the trusted viewer IP for API rate limiting
         Runtime: cloudfront-js-2.0
       Name: !Sub "${AWS::StackName}-api-viewer-address"
 
@@ -231,6 +272,30 @@ Resources:
         why: fixed-window abuse guard for credential grants; stores only SHA-256 client hash & auto-expires after 2h
         must:
           - TTL stays enabled; no raw viewer IP stored
+        mutable: change-with-constraints
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: clientWindow
+          AttributeType: S
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+        - AttributeName: clientWindow
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  AnalysisRateLimitTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: fixed-window Gemini cost guard; stores only SHA-256 client hash & auto-expires after 2h
+        must:
+          - TTL stays enabled; no raw viewer IP or note content stored
         mutable: change-with-constraints
     Properties:
       AttributeDefinitions:
@@ -365,10 +430,86 @@ Resources:
       LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-session-broker"
       RetentionInDays: 14
 
+  NoteAnalyzerExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: least-privilege note analyzer role; reads one API key secret, consumes rate counter, emits retained logs
+        must:
+          - no access to note storage or Transcribe permissions
+          - Secrets Manager access remains scoped to GeminiApiKeySecret
+        mutable: review-required
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: NoteAnalyzerRuntime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteFunctionLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${NoteAnalyzerLogGroup.Arn}:*"
+              - Sid: ConsumeRateLimit
+                Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource: !GetAtt AnalysisRateLimitTable.Arn
+              - Sid: ReadGeminiApiKey
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref GeminiApiKeySecret
+
+  NoteAnalyzerFunction:
+    Type: AWS::Serverless::Function
+    DependsOn:
+      - NoteAnalyzerLogGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: synchronous on-demand note extraction; Lambda over resident server because requests are sparse
+        must:
+          - no VPC/NAT; timeout < API Gateway 30s max
+          - origin secret, per-IP rate limit & bounded input required before Gemini call
+          - API key read from Secrets Manager at runtime and never logged
+        mutable: change-with-constraints
+    Properties:
+      Architectures:
+        - arm64
+      CodeUri: functions/note-analyzer/
+      Environment:
+        Variables:
+          ANALYSIS_RATE_LIMIT_PER_HOUR: !Ref AnalysisRateLimitPerHour
+          ANALYSIS_RATE_LIMIT_TABLE: !Ref AnalysisRateLimitTable
+          GEMINI_API_KEY_SECRET_ID: !Ref GeminiApiKeySecret
+          GEMINI_MODEL: gemini-3.5-flash-lite
+          GEMINI_TIMEOUT_MILLISECONDS: "20000"
+          ORIGIN_SECRET: !Sub "{{resolve:secretsmanager:${OriginVerificationSecret}:SecretString}}"
+      FunctionName: !Sub "${AWS::StackName}-note-analyzer"
+      Handler: index.handler
+      MemorySize: 256
+      Role: !GetAtt NoteAnalyzerExecutionRole.Arn
+      Runtime: nodejs22.x
+      Timeout: 25
+
+  NoteAnalyzerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-note-analyzer"
+      RetentionInDays: 14
+
   TranscriptionApi:
     Type: AWS::ApiGatewayV2::Api
     Properties:
-      Description: CloudFront-only session broker API
+      Description: CloudFront-only application API
       DisableExecuteApiEndpoint: false
       Name: !Sub "${AWS::StackName}-http"
       ProtocolType: HTTP
@@ -391,14 +532,32 @@ Resources:
       RouteKey: POST /api/transcribe-session
       Target: !Sub "integrations/${TranscriptionApiIntegration}"
 
+  NoteAnalyzerApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref TranscriptionApi
+      IntegrationMethod: POST
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt NoteAnalyzerFunction.Arn
+      PayloadFormatVersion: "2.0"
+      TimeoutInMillis: 29000
+
+  NoteAnalyzerApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref TranscriptionApi
+      AuthorizationType: NONE
+      RouteKey: POST /api/analyze
+      Target: !Sub "integrations/${NoteAnalyzerApiIntegration}"
+
   TranscriptionApiStage:
     Type: AWS::ApiGatewayV2::Stage
     Properties:
       ApiId: !Ref TranscriptionApi
       AutoDeploy: true
       DefaultRouteSettings:
-        ThrottlingBurstLimit: 2
-        ThrottlingRateLimit: 1
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
       StageName: $default
 
   SessionBrokerInvokePermission:
@@ -409,6 +568,15 @@ Resources:
       Principal: apigateway.amazonaws.com
       SourceAccount: !Ref AWS::AccountId
       SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${TranscriptionApi}/*/POST/api/transcribe-session"
+
+  NoteAnalyzerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref NoteAnalyzerFunction
+      Principal: apigateway.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${TranscriptionApi}/*/POST/api/analyze"
 
   WebDistribution:
     Type: AWS::CloudFront::Distribution
@@ -425,7 +593,7 @@ Resources:
           - UseCustomDomain
           - - !Ref CustomDomainName
           - !Ref AWS::NoValue
-        Comment: Connect5ive static application and transcription session API
+        Comment: Connect5ive static application and on-demand APIs
         CustomErrorResponses:
           - ErrorCachingMinTTL: 0
             ErrorCode: 403
@@ -453,6 +621,28 @@ Resources:
           TargetOriginId: StaticSiteOrigin
           ViewerProtocolPolicy: redirect-to-https
         CacheBehaviors:
+          - PathPattern: /api/analyze
+            AllowedMethods:
+              - DELETE
+              - GET
+              - HEAD
+              - OPTIONS
+              - PATCH
+              - POST
+              - PUT
+            CachePolicyId: !Ref ApiNoCachePolicy
+            CachedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+            Compress: true
+            FunctionAssociations:
+              - EventType: viewer-request
+                FunctionARN: !GetAtt ApiViewerAddressFunction.FunctionARN
+            OriginRequestPolicyId: !Ref ApiOriginRequestPolicy
+            ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+            TargetOriginId: SessionApiOrigin
+            ViewerProtocolPolicy: https-only
           - PathPattern: /api/transcribe-session
             AllowedMethods:
               - DELETE
@@ -475,6 +665,25 @@ Resources:
             ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
             TargetOriginId: SessionApiOrigin
             ViewerProtocolPolicy: https-only
+          - PathPattern: /api/*
+            AllowedMethods:
+              - DELETE
+              - GET
+              - HEAD
+              - OPTIONS
+              - PATCH
+              - POST
+              - PUT
+            CachePolicyId: !Ref ApiNoCachePolicy
+            CachedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+            Compress: true
+            OriginRequestPolicyId: !Ref LaravelApiOriginRequestPolicy
+            ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+            TargetOriginId: SessionApiOrigin
+            ViewerProtocolPolicy: https-only
         DefaultRootObject: index.html
         Enabled: true
         HttpVersion: http2and3
@@ -488,7 +697,7 @@ Resources:
           - CustomOriginConfig:
               HTTPSPort: 443
               OriginProtocolPolicy: https-only
-              OriginReadTimeout: 10
+              OriginReadTimeout: 30
               OriginSSLProtocols:
                 - TLSv1.2
             DomainName: !Sub "${TranscriptionApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}"
@@ -538,6 +747,15 @@ Resources:
                 aws:SecureTransport: "false"
 
 Outputs:
+  OriginVerificationSecretArn:
+    Description: Secret copied into the Laravel runtime SSM parameter during setup
+    Value: !Ref OriginVerificationSecret
+  TranscriptionApiId:
+    Description: Existing HTTP API extended by the Laravel serverless deployment
+    Value: !Ref TranscriptionApi
+  GeminiApiKeySecretArn:
+    Description: Secret to populate with the Gemini API key before using note analysis
+    Value: !Ref GeminiApiKeySecret
   StaticSiteBucketName:
     Description: Private bucket that receives the Next.js out directory
     Value: !Ref StaticSiteBucket

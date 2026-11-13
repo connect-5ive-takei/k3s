@@ -1,6 +1,6 @@
 # サーバーレスWeb配信への移行記録
 
-更新日: 2026-10-27
+更新日: 2026-10-30
 
 ## 結論
 
@@ -24,6 +24,10 @@ Browser
   ├─ POST /api/transcribe-session
   │            └─ API Gateway HTTP API ─> Lambda ─> STS AssumeRole
   │                                             └─ DynamoDB rate limit
+  ├─ POST /api/analyze
+  │            └─ API Gateway HTTP API ─> Lambda ─> Gemini API
+  │                                             ├─ Secrets Manager API key
+  │                                             └─ DynamoDB rate limit
   └─ temporary credentials ─> Amazon Transcribe Streaming
 ```
 
@@ -44,8 +48,10 @@ CloudFormationスタック:
   - セキュリティレスポンスヘッダー、静的/API別キャッシュポリシー
   - API Gateway HTTP API
   - セッション発行Lambda
-  - 時間/IP別レート制限用DynamoDBテーブル
+  - ノート分析Lambda
+  - セッション発行・ノート分析それぞれの時間/IP別レート制限用DynamoDBテーブル
   - CloudFront―Lambda間の検証値を生成するSecrets Manager Secret
+  - Gemini APIキー用Secrets Manager Secret（値はデプロイ時に別経路で登録）
   - Lambda実行ロール、ブラウザ用Transcribe限定ロール
   - CloudWatch Logs（14日保持）
 - `connect5ive-serverless-frontend-deploy-policy`
@@ -55,9 +61,10 @@ CloudFormationスタック:
 
 主要設定:
 
-- Lambda: Node.js 22、arm64、128MB、タイムアウト10秒、オンデマンド
+- Lambda: Node.js 22、arm64、オンデマンド（セッション発行128MB/10秒、ノート分析256MB/25秒）
 - API Gateway: 毎秒1リクエスト、バースト2
 - セッション発行: 同一IPにつきUTC 1時間6回まで
+- ノート分析: 同一IPにつきUTC 1時間20回まで、入力本文は8,000 bytesまで
 - クライアントIP: API用CloudFront Functionが `event.viewer.ip` から設定し、Lambdaへ転送
 - STS認証情報: 15分で失効
 - Transcribe開始権限: HTTP/2とWebSocketの開始だけを許可し、新しい接続を開始できる時間は発行後60秒まで
@@ -82,6 +89,8 @@ IAMの `transcribe:StartStreamTranscription` と `transcribe:StartStreamTranscri
 - AWS SDKは文字起こし開始時にdynamic importし、初期ページロードへ常時含めない。
 - 音声キューを10秒分に制限し、過剰バッファを防ぐ。
 - `/healthz` はRoute Handlerから `public/healthz` の静的JSONへ変更した。
+- ノート分析用POST Route Handlerは静的出力で実行できないため、同一オリジンのLambda APIへ移した。
+- 開発時の `/api/analyze` はNext.js rewriteで本番CloudFrontへ中継する。
 - 従来k3s用のWebSocketゲートウェイは削除せず、通常ビルドでは従来方式を維持する。
 
 静的配信用ビルド:
@@ -100,7 +109,8 @@ npm run build
 - `serverless/bootstrap.yaml`: パッケージ保存用スタック
 - `serverless/template.yaml`: アプリ本体スタック
 - `serverless/functions/session-broker/`: Lambda実装とロック済み依存関係
-- `serverless/tests/`: セッションポリシー、IP解析、レート制限キーのテスト
+- `serverless/functions/note-analyzer/`: Geminiノート分析Lambdaとロック済み依存関係
+- `serverless/tests/`: セッションポリシー、入力/出力検証、IP解析、レート制限キーのテスト
 - `scripts/deploy-serverless.sh`: ビルド、パッケージ、CloudFormation、S3同期、CloudFront invalidation
 
 既存の `base/`、`overlays/production/`、Traefik、cert-managerは変更していない。
@@ -148,7 +158,10 @@ ECRへのpushとEC2/k3sへの自動デプロイ要求は停止した。バック
 - S3、CloudFront、HTTP API、Lambda、DynamoDBは使用量課金で、低トラフィック時は無料枠内に
   収まりやすい。
 - 主な変動費はAmazon Transcribeの音声時間。
-- Secrets Managerは約$0.40/月の固定費が発生するが、検証値を平文デプロイパラメータへ保存しないため採用。
+- Secrets Managerはシークレットごとの月額が発生するが、検証値とGemini APIキーを平文の
+  デプロイパラメータやLambda環境変数へ保存しないため採用。
+- ノート分析時はGemini APIの利用量に応じた料金が発生する。IP別上限とAPI Gatewayスロットルで
+  意図しない連続実行を抑える。
 - AWSコンソール上のアクティブなクレジット残高は0表示だったため、クレジット継続を前提にしない。
 
 ## デプロイとロールバック
@@ -157,11 +170,13 @@ ECRへのpushとEC2/k3sへの自動デプロイ要求は停止した。バック
 
 ```bash
 cd /Users/jirou/Desktop/3/comit5ive/k3s
-./scripts/deploy-serverless.sh
+GEMINI_API_KEY_FILE=/path/to/protected/gemini-api-key.txt ./scripts/deploy-serverless.sh
 ```
 
 CloudFront―Lambda間の検証値はSecrets Managerが生成し、CloudFormationが動的参照する。値をCI Secretや
-ローカル環境変数へコピーしない。
+ローカル環境変数へコピーしない。Gemini APIキーのファイルは所有者だけが読める権限にし、初回登録または
+キー更新時だけ `GEMINI_API_KEY_FILE` を指定する。デプロイスクリプトは値を表示せずSecrets Managerへ登録する。
+登録済みであれば、次回以降は `GEMINI_API_KEY_FILE` を省略できる。
 
 静的サイトだけを戻す場合は、S3の以前のバージョンを復元するか、対象Git revisionで再ビルド・再同期する。
 インフラを戻す場合はCloudFormationで以前のテンプレートを再デプロイする。S3バケットはスタック削除時も
@@ -169,18 +184,18 @@ CloudFront―Lambda間の検証値はSecrets Managerが生成し、CloudFormatio
 
 ## 検証結果
 
-- Lambda単体テスト: 3件成功
+- サーバーレス実装・テンプレートテスト: 14件成功
 - 従来ゲートウェイテスト: 7件成功
 - ESLint: 成功
 - Next.js静的ビルド: 成功
 - Next.js standaloneビルド: 成功
-- CloudFormationテンプレート検証: 成功
-- CloudFormation事前検証イベント: エラー0件
+- CloudFormation YAML解析: 成功（30リソース、5出力）
+- ノート分析追加後のCloudFormationサービス検証: AWSローカルセッション期限切れのため未実施
 - `/`, `/Home/`, `/healthz`: HTTP 200
 - セッションAPI: HTTP 200、レスポンス形状検証成功
 - API Gateway直アクセス: HTTP 403
 - 短い無音ストリームによるTranscribe接続: 成功
 
-ローカル環境にcfn-lint/cfn-guardがなかったため、これらのローカル検査は未実施。AWSのテンプレート検証と
-CloudFormation事前検証は実施した。アカウントに永続CloudTrail Trailはなく、監査保持は標準Event History
-相当である。
+ローカル環境にcfn-lint/cfn-guardがなかったため、これらのローカル検査は未実施。既存構成のAWSテンプレート
+検証とCloudFormation事前検証は実施済みだが、ノート分析追加後は再認証して再実行する必要がある。
+アカウントに永続CloudTrail Trailはなく、監査保持は標準Event History相当である。

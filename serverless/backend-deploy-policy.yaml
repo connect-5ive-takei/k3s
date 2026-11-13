@@ -1,0 +1,265 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Connect5ive backend deployment roles — lets the production GitHub workflow package
+  Laravel and the Python summarizer for Lambda while updating only Laravel routes in
+  the shared HTTP API
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+  com.aws.cloudformation.Context:
+    arch: backend workflow -> OIDC deploy role -> CFN service role -> Laravel + summarizer Lambda; Laravel routes -> shared HTTP API
+    must:
+      - Trust only the backend repository's main branch production environment
+      - Keep runtime SSM access under the backend production parameter prefix
+      - Limit API Gateway mutation to the shared API's integrations and routes
+      - Keep summarizer private; invoke only through IAM
+
+Parameters:
+  ApplicationStackName:
+    Type: String
+    Default: connect5ive-serverless
+    AllowedPattern: "^[A-Za-z][-A-Za-z0-9]{0,127}$"
+  BootstrapStackName:
+    Type: String
+    Default: connect5ive-serverless-bootstrap
+    AllowedPattern: "^[A-Za-z][-A-Za-z0-9]{0,127}$"
+  BackendStackName:
+    Type: String
+    Default: connect5ive-backend-prod
+    AllowedPattern: "^[A-Za-z][-A-Za-z0-9]{0,127}$"
+  SummarizerStackName:
+    Type: String
+    Default: connect5ive-summarizer-prod
+    AllowedPattern: "^[A-Za-z][-A-Za-z0-9]{0,127}$"
+  ArtifactBucketName:
+    Type: String
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+  HttpApiId:
+    Type: String
+    AllowedPattern: "^[a-z0-9]+$"
+
+Resources:
+  BackendCloudFormationExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: isolates CloudFormation resource mutation from the GitHub OIDC session
+        must:
+          - mutate only backend + summarizer Lambda, log, and IAM resources
+          - mutate only routes and integrations in the supplied shared HTTP API
+          - read deployment packages only from the retained artifact bucket
+        mutable: review-required
+    Properties:
+      RoleName: Connect5iveBackendCloudFormationExecutionRole
+      Description: CloudFormation execution role for Connect5ive backend Lambda stacks
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ManageBackendServerlessStacks
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadDeploymentArtifacts
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}/serverless/*"
+              - Sid: ManageApplicationFunctions
+                Effect: Allow
+                Action:
+                  - lambda:AddPermission
+                  - lambda:CreateFunction
+                  - lambda:DeleteFunctionConcurrency
+                  - lambda:DeleteFunction
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:ListTags
+                  - lambda:ListVersionsByFunction
+                  - lambda:PutFunctionConcurrency
+                  - lambda:PublishVersion
+                  - lambda:RemovePermission
+                  - lambda:TagResource
+                  - lambda:UntagResource
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${BackendStackName}-*"
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${SummarizerStackName}-*"
+              - Sid: ReadBrefLayers
+                Effect: Allow
+                Action: lambda:GetLayerVersion
+                Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:*:layer:arm-php-85:*"
+              - Sid: ManageApplicationLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:DescribeLogGroups
+                  - logs:ListTagsForResource
+                  - logs:PutRetentionPolicy
+                  - logs:TagResource
+                  - logs:UntagResource
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${BackendStackName}-*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${SummarizerStackName}-*"
+              - Sid: ManageApplicationExecutionRoles
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:DeleteRolePolicy
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:PassRole
+                  - iam:PutRolePolicy
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:UpdateAssumeRolePolicy
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${BackendStackName}-*"
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${SummarizerStackName}-*"
+              - Sid: ManageBackendApiRoutes
+                Effect: Allow
+                Action:
+                  - apigateway:DELETE
+                  - apigateway:GET
+                  - apigateway:PATCH
+                  - apigateway:POST
+                  - apigateway:PUT
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis/${HttpApiId}/integrations"
+                  - !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis/${HttpApiId}/integrations/*"
+                  - !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis/${HttpApiId}/routes"
+                  - !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis/${HttpApiId}/routes/*"
+      Tags:
+        - Key: Project
+          Value: Connect5ive
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  BackendServerlessDeployRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: replaces ECR publishing and k3s notification with a purpose-scoped Lambda deployment identity
+        must:
+          - OIDC aud = sts.amazonaws.com
+          - OIDC sub = backend production environment and ref = main
+          - pass only BackendCloudFormationExecutionRole
+          - never read backend runtime SSM parameter values
+          - invoke only backend migration + summarizer smoke-test functions
+        mutable: review-required
+    Properties:
+      RoleName: Connect5iveBackendServerlessDeployRole
+      Description: GitHub Actions deployment to Connect5ive backend Lambda stacks
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: GitHubActionsProductionEnvironment
+            Effect: Allow
+            Principal:
+              Federated: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:ref: refs/heads/main
+                token.actions.githubusercontent.com:sub:
+                  - repo:connect-5ive-takei/backend:environment:production
+                  - repo:connect-5ive-takei@336816162/backend@1402241221:environment:production
+      Policies:
+        - PolicyName: DeployBackendServerlessStacks
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadSharedStackOutputs
+                Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ApplicationStackName}/*"
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${BootstrapStackName}/*"
+              - Sid: ManageApplicationStacks
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:CreateStack
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:DescribeStacks
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:GetTemplate
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:ListStackResources
+                  - cloudformation:UpdateStack
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${BackendStackName}/*"
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${SummarizerStackName}/*"
+              - Sid: ValidateBackendTemplate
+                Effect: Allow
+                Action: cloudformation:ValidateTemplate
+                Resource: "*"
+              - Sid: ReadApplicationFunctions
+                Effect: Allow
+                Action: lambda:GetFunction
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${BackendStackName}-*"
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${SummarizerStackName}-*"
+              - Sid: ReadSharedHttpApi
+                Effect: Allow
+                Action: apigateway:GET
+                Resource: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis/${HttpApiId}"
+              - Sid: UseDeploymentBucket
+                Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}"
+              - Sid: PublishDeploymentArtifacts
+                Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}/serverless/*"
+              - Sid: RunBackendMigrations
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${BackendStackName}-artisan"
+              - Sid: VerifySummarizerDeployment
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${SummarizerStackName}-summarize"
+              - Sid: PassCloudFormationExecutionRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt BackendCloudFormationExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+      Tags:
+        - Key: Project
+          Value: Connect5ive
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Repository
+          Value: backend
+
+Outputs:
+  CloudFormationExecutionRoleArn:
+    Description: Service role passed to CloudFormation by the backend deployment
+    Value: !GetAtt BackendCloudFormationExecutionRole.Arn
+  DeploymentRoleArn:
+    Description: GitHub Actions OIDC role for the serverless backend deployment
+    Value: !GetAtt BackendServerlessDeployRole.Arn

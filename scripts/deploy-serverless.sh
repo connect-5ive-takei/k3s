@@ -5,12 +5,18 @@ set -Eeuo pipefail
 aws_region="${AWS_REGION:-ap-southeast-2}"
 bootstrap_stack="${BOOTSTRAP_STACK_NAME:-connect5ive-serverless-bootstrap}"
 application_stack="${APPLICATION_STACK_NAME:-connect5ive-serverless}"
+backend_deploy_policy_stack="${BACKEND_DEPLOY_POLICY_STACK_NAME:-connect5ive-backend-deploy-policy}"
+backend_stack="${BACKEND_STACK_NAME:-connect5ive-backend-prod}"
+summarizer_stack="${SUMMARIZER_STACK_NAME:-connect5ive-summarizer-prod}"
 rate_limit_per_hour="${RATE_LIMIT_PER_HOUR:-6}"
+analysis_rate_limit_per_hour="${ANALYSIS_RATE_LIMIT_PER_HOUR:-20}"
 custom_domain_name="${CUSTOM_DOMAIN_NAME-}"
 cloudfront_certificate_arn="${CLOUDFRONT_CERTIFICATE_ARN-}"
+gemini_api_key_file="${GEMINI_API_KEY_FILE-}"
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 frontend_root="$(cd "${repository_root}/../frontend" && pwd)"
 broker_root="${repository_root}/serverless/functions/session-broker"
+analyzer_root="${repository_root}/serverless/functions/note-analyzer"
 
 for command_name in aws npm; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
@@ -22,6 +28,15 @@ done
 if [[ ! "$rate_limit_per_hour" =~ ^[1-9][0-9]*$ ]] || (( rate_limit_per_hour > 60 )); then
   echo "RATE_LIMIT_PER_HOUR must be an integer between 1 and 60." >&2
   exit 64
+fi
+if [[ ! "$analysis_rate_limit_per_hour" =~ ^[1-9][0-9]*$ ]] || (( analysis_rate_limit_per_hour > 100 )); then
+  echo "ANALYSIS_RATE_LIMIT_PER_HOUR must be an integer between 1 and 100." >&2
+  exit 64
+fi
+if [[ -n "$gemini_api_key_file" ]] && \
+  { [[ ! -f "$gemini_api_key_file" ]] || [[ ! -r "$gemini_api_key_file" ]] || [[ ! -s "$gemini_api_key_file" ]]; }; then
+  echo "GEMINI_API_KEY_FILE must point to a readable, non-empty regular file." >&2
+  exit 66
 fi
 
 custom_domain_is_set=false
@@ -36,6 +51,28 @@ if [[ "$custom_domain_is_set" != "$certificate_arn_is_set" ]] || \
   exit 64
 fi
 
+if [[ -z "$gemini_api_key_file" ]]; then
+  existing_gemini_secret_arn="$(aws cloudformation describe-stacks \
+    --region "$aws_region" \
+    --stack-name "$application_stack" \
+    --query 'Stacks[0].Outputs[?OutputKey==`GeminiApiKeySecretArn`].OutputValue | [0]' \
+    --output text 2>/dev/null || true)"
+  if [[ ! "$existing_gemini_secret_arn" =~ ^arn:[^:]+:secretsmanager:[^:]+:[0-9]{12}:secret:.+$ ]]; then
+    echo "GEMINI_API_KEY_FILE is required for the first note analyzer deployment." >&2
+    exit 78
+  fi
+
+  current_secret_versions="$(aws secretsmanager list-secret-version-ids \
+    --region "$aws_region" \
+    --secret-id "$existing_gemini_secret_arn" \
+    --query 'length(Versions[?contains(VersionStages, `AWSCURRENT`)])' \
+    --output text)"
+  if [[ "$current_secret_versions" != "1" ]]; then
+    echo "Gemini API key is not configured. Set GEMINI_API_KEY_FILE to a protected file and rerun deployment." >&2
+    exit 78
+  fi
+fi
+
 temporary_directory="$(mktemp -d)"
 cleanup() {
   rm -rf -- "$temporary_directory"
@@ -43,7 +80,9 @@ cleanup() {
 trap cleanup EXIT
 
 echo "Installing deterministic Lambda production dependencies."
-npm --prefix "$broker_root" ci --omit=dev --no-audit --no-fund
+for function_root in "$broker_root" "$analyzer_root"; do
+  npm --prefix "$function_root" ci --omit=dev --no-audit --no-fund
+done
 
 echo "Building the Next.js static export."
 (
@@ -60,7 +99,10 @@ if [[ ! -f "${frontend_root}/out/index.html" ]]; then
 fi
 
 echo "Deploying the private CloudFormation packaging bucket."
-parameter_overrides=("RateLimitPerHour=${rate_limit_per_hour}")
+parameter_overrides=(
+  "RateLimitPerHour=${rate_limit_per_hour}"
+  "AnalysisRateLimitPerHour=${analysis_rate_limit_per_hour}"
+)
 if [[ "$custom_domain_is_set" == true ]]; then
   parameter_overrides+=(
     "CustomDomainName=${custom_domain_name}"
@@ -112,6 +154,8 @@ read_stack_output() {
 site_bucket="$(read_stack_output StaticSiteBucketName)"
 distribution_id="$(read_stack_output CloudFrontDistributionId)"
 site_url="$(read_stack_output SiteUrl)"
+gemini_api_key_secret_arn="$(read_stack_output GeminiApiKeySecretArn)"
+http_api_id="$(read_stack_output TranscriptionApiId)"
 
 if [[ -z "$site_bucket" || "$site_bucket" == "None" ]]; then
   echo "CloudFormation did not return the static site bucket." >&2
@@ -120,6 +164,39 @@ fi
 if [[ ! "$distribution_id" =~ ^[A-Z0-9]+$ ]]; then
   echo "CloudFormation returned an invalid CloudFront distribution ID." >&2
   exit 70
+fi
+if [[ ! "$gemini_api_key_secret_arn" =~ ^arn:[^:]+:secretsmanager:[^:]+:[0-9]{12}:secret:.+$ ]]; then
+  echo "CloudFormation returned an invalid Gemini API key secret ARN." >&2
+  exit 70
+fi
+if [[ ! "$http_api_id" =~ ^[a-z0-9]+$ ]]; then
+  echo "CloudFormation returned an invalid HTTP API ID." >&2
+  exit 70
+fi
+
+echo "Deploying the least-privilege backend deployment roles."
+aws cloudformation deploy \
+  --region "$aws_region" \
+  --stack-name "$backend_deploy_policy_stack" \
+  --template-file "${repository_root}/serverless/backend-deploy-policy.yaml" \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides \
+    "ApplicationStackName=${application_stack}" \
+    "BootstrapStackName=${bootstrap_stack}" \
+    "BackendStackName=${backend_stack}" \
+    "SummarizerStackName=${summarizer_stack}" \
+    "ArtifactBucketName=${artifact_bucket}" \
+    "HttpApiId=${http_api_id}" \
+  --no-fail-on-empty-changeset
+
+if [[ -n "$gemini_api_key_file" ]]; then
+  echo "Updating the Gemini API key in Secrets Manager."
+  aws secretsmanager put-secret-value \
+    --region "$aws_region" \
+    --secret-id "$gemini_api_key_secret_arn" \
+    --secret-string "file://${gemini_api_key_file}" \
+    --query VersionId \
+    --output text >/dev/null
 fi
 
 echo "Publishing the static export to the private site bucket."

@@ -238,3 +238,18 @@ jobs:
             echo "Expected unauthenticated /api/user to return 401, got ${api_status}." >&2
             exit 1
           fi
+
+          curl --fail --silent --show-error \
+            --retry 5 --retry-all-errors --retry-delay 3 \
+            --connect-timeout 10 --max-time 30 \
+            "https://${PUBLIC_HOST}/api/documentation" >/dev/null
+
+          openapi_title="$(curl --fail --silent --show-error \
+            --retry 5 --retry-all-errors --retry-delay 3 \
+            --connect-timeout 10 --max-time 30 \
+            "https://${PUBLIC_HOST}/api/docs" | jq -r '.info.title // empty')"
+
+          if [[ "$openapi_title" != "Connect5ive API" ]]; then
+            echo "Expected OpenAPI title Connect5ive API, got ${openapi_title:-<empty>}." >&2
+            exit 1
+          fi

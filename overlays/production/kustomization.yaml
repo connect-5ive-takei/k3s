@@ -22,5 +22,8 @@ configMapGenerator:
     behavior: merge
     literals:
       - APP_URL=https://__PUBLIC_HOST__
+      - API_DOCUMENTATION_ENABLED=true
+      - L5_SWAGGER_GENERATE_ALWAYS=false
       - SESSION_SECURE_COOKIE=true
       - SANCTUM_STATEFUL_DOMAINS=__PUBLIC_HOST__
+      - TRUSTED_PROXIES=*
