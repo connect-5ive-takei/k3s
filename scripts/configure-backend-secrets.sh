@@ -16,6 +16,7 @@ done
 
 required_variables=(
   APP_KEY
+  JWT_SECRET
   DB_HOST
   DB_PORT
   DB_DATABASE
@@ -33,6 +34,10 @@ done
 
 if [[ ! "$APP_KEY" =~ ^base64:.+ ]]; then
   echo "APP_KEY must be a Laravel base64 application key." >&2
+  exit 64
+fi
+if [[ ! "$JWT_SECRET" =~ ^base64:.+ ]]; then
+  echo "JWT_SECRET must be a base64-encoded signing key." >&2
   exit 64
 fi
 if [[ ! "$DB_PORT" =~ ^[0-9]{1,5}$ ]] || (( DB_PORT < 1 || DB_PORT > 65535 )); then

@@ -87,9 +87,7 @@ done
 echo "Building the Next.js static export."
 (
   cd "$frontend_root"
-  NEXT_STATIC_EXPORT=true \
-    NEXT_PUBLIC_TRANSCRIBE_TRANSPORT=direct \
-    NEXT_PUBLIC_TRANSCRIBE_SESSION_ENDPOINT=/api/transcribe-session \
+  NEXT_PUBLIC_TRANSCRIBE_SESSION_ENDPOINT=/api/transcribe-session \
     npm run build
 )
 

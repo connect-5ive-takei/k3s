@@ -20,3 +20,10 @@ test("backend secret setup resolves the origin secret when the stack output is a
     /--query 'StackResourceDetail\.PhysicalResourceId'/,
   );
 });
+
+test("backend secret setup stores the JWT signing secret as an encrypted parameter", async () => {
+  const script = await readFile(scriptUrl, "utf8");
+
+  assert.match(script, /required_variables=\([\s\S]*?JWT_SECRET/);
+  assert.match(script, /put_secure_parameter "\$variable_name" "\$\{!variable_name\}"/);
+});
