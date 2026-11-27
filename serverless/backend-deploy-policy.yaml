@@ -1,8 +1,8 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
   Connect5ive backend deployment roles — lets the production GitHub workflow package
-  Laravel and the Python summarizer for Lambda while updating only Laravel routes in
-  the shared HTTP API
+  Laravel and the rule/BERT summarizers for Lambda, publish versioned model images,
+  and update only Laravel routes in the shared HTTP API
 
 Metadata:
   AWSToolsMetrics:
@@ -32,6 +32,10 @@ Parameters:
     Type: String
     Default: connect5ive-summarizer-prod
     AllowedPattern: "^[A-Za-z][-A-Za-z0-9]{0,127}$"
+  MlSummarizerStackName:
+    Type: String
+    Default: connect5ive-summarizer-ml-prod
+    AllowedPattern: "^[a-z][-a-z0-9]{0,127}$"
   ArtifactBucketName:
     Type: String
     AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
@@ -40,6 +44,43 @@ Parameters:
     AllowedPattern: "^[a-z0-9]+$"
 
 Resources:
+  SummarizerImageRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: retain versioned BERT images independently of Lambda updates for rollback
+        must:
+          - immutable tags; never overwrite a released model
+          - image reads by Lambda restricted to the ML summarizer function
+          - retain images when this deployment-policy stack is removed
+    Properties:
+      RepositoryName: !Sub "${MlSummarizerStackName}-images"
+      ImageTagMutability: IMMUTABLE
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      RepositoryPolicyText:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: LambdaImageRetrieval
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - ecr:BatchGetImage
+              - ecr:GetDownloadUrlForLayer
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${MlSummarizerStackName}-summarize"
+      Tags:
+        - Key: Project
+          Value: Connect5ive
+        - Key: ManagedBy
+          Value: CloudFormation
+
   BackendCloudFormationExecutionRole:
     Type: AWS::IAM::Role
     Metadata:
@@ -49,6 +90,7 @@ Resources:
           - mutate only backend + summarizer Lambda, log, and IAM resources
           - mutate only routes and integrations in the supplied shared HTTP API
           - read deployment packages only from the retained artifact bucket
+          - manage image retrieval only in the model repository
         mutable: review-required
     Properties:
       RoleName: Connect5iveBackendCloudFormationExecutionRole
@@ -92,6 +134,15 @@ Resources:
                 Resource:
                   - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${BackendStackName}-*"
                   - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${SummarizerStackName}-*"
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${MlSummarizerStackName}-*"
+              - Sid: ReadSummarizerImages
+                Effect: Allow
+                Action:
+                  - ecr:GetRepositoryPolicy
+                  - ecr:SetRepositoryPolicy
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !GetAtt SummarizerImageRepository.Arn
               - Sid: ReadBrefLayers
                 Effect: Allow
                 Action: lambda:GetLayerVersion
@@ -109,6 +160,7 @@ Resources:
                 Resource:
                   - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${BackendStackName}-*"
                   - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${SummarizerStackName}-*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${MlSummarizerStackName}-*"
               - Sid: ManageApplicationExecutionRoles
                 Effect: Allow
                 Action:
@@ -126,6 +178,7 @@ Resources:
                 Resource:
                   - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${BackendStackName}-*"
                   - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${SummarizerStackName}-*"
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${MlSummarizerStackName}-*"
               - Sid: ManageBackendApiRoutes
                 Effect: Allow
                 Action:
@@ -149,7 +202,7 @@ Resources:
     Type: AWS::IAM::Role
     Metadata:
       com.aws.cloudformation.Context:
-        why: replaces ECR publishing and k3s notification with a purpose-scoped Lambda deployment identity
+        why: deploy backend Lambdas and publish only versioned ML summarizer images
         must:
           - OIDC aud = sts.amazonaws.com
           - OIDC sub = backend production environment and ref = main
@@ -206,6 +259,7 @@ Resources:
                 Resource:
                   - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${BackendStackName}/*"
                   - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${SummarizerStackName}/*"
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${MlSummarizerStackName}/*"
               - Sid: ValidateBackendTemplate
                 Effect: Allow
                 Action: cloudformation:ValidateTemplate
@@ -216,6 +270,24 @@ Resources:
                 Resource:
                   - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${BackendStackName}-*"
                   - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${SummarizerStackName}-*"
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${MlSummarizerStackName}-*"
+              - Sid: AuthenticateToImageRegistry
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: PublishSummarizerImages
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeImages
+                  - ecr:DescribeRepositories
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !GetAtt SummarizerImageRepository.Arn
               - Sid: ReadSharedHttpApi
                 Effect: Allow
                 Action: apigateway:GET
@@ -240,7 +312,9 @@ Resources:
               - Sid: VerifySummarizerDeployment
                 Effect: Allow
                 Action: lambda:InvokeFunction
-                Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${SummarizerStackName}-summarize"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${SummarizerStackName}-summarize"
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${MlSummarizerStackName}-summarize"
               - Sid: PassCloudFormationExecutionRole
                 Effect: Allow
                 Action: iam:PassRole
@@ -257,6 +331,9 @@ Resources:
           Value: backend
 
 Outputs:
+  SummarizerImageRepositoryUri:
+    Description: Private image repository for the BERT summarizer
+    Value: !GetAtt SummarizerImageRepository.RepositoryUri
   CloudFormationExecutionRoleArn:
     Description: Service role passed to CloudFormation by the backend deployment
     Value: !GetAtt BackendCloudFormationExecutionRole.Arn
