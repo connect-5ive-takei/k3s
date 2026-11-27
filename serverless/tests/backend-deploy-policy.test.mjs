@@ -73,3 +73,57 @@ test("deployment role can inspect only the shared HTTP API root", async () => {
     /Sid: ReadSharedHttpApi[\s\S]*?::\/apis\/\$\{HttpApiId\}\/\*/,
   );
 });
+
+test("BERT deployment permissions stay within the ML stack and its image repository", async () => {
+  const template = await readFile(templateUrl, "utf8");
+  const executionRole = template.match(
+    /  BackendCloudFormationExecutionRole:[\s\S]*?(?=\n  BackendServerlessDeployRole:)/,
+  )?.[0];
+  const deploymentRole = template.match(
+    /  BackendServerlessDeployRole:[\s\S]*?(?=\nOutputs:)/,
+  )?.[0];
+
+  assert.ok(executionRole);
+  assert.ok(deploymentRole);
+  assert.match(executionRole, /function:\$\{MlSummarizerStackName\}-\*"/);
+  assert.match(executionRole, /log-group:\/aws\/lambda\/\$\{MlSummarizerStackName\}-\*"/);
+  assert.match(executionRole, /role\/\$\{MlSummarizerStackName\}-\*"/);
+  assert.match(deploymentRole, /stack\/\$\{MlSummarizerStackName\}\/\*"/);
+  assert.match(
+    deploymentRole,
+    /Sid: VerifySummarizerDeployment[\s\S]*?function:\$\{MlSummarizerStackName\}-summarize"/,
+  );
+  for (const [role, sid] of [
+    [executionRole, "ReadSummarizerImages"],
+    [deploymentRole, "PublishSummarizerImages"],
+  ]) {
+    const statement = role.match(
+      new RegExp(`- Sid: ${sid}\\n[\\s\\S]*?(?=\\n              - Sid:)`),
+    )?.[0];
+    assert.ok(statement);
+    assert.match(statement, /Resource: !GetAtt SummarizerImageRepository.Arn/);
+    assert.doesNotMatch(statement, /Resource: ["']?\*|ecr:\*/);
+  }
+  assert.doesNotMatch(deploymentRole, /ssm:GetParameters|ecr:DeleteRepository/);
+});
+
+test("released model images are retained, encrypted, immutable, and private", async () => {
+  const template = await readFile(templateUrl, "utf8");
+  const repository = template.match(
+    /  SummarizerImageRepository:[\s\S]*?(?=\n  BackendCloudFormationExecutionRole:)/,
+  )?.[0];
+
+  assert.ok(repository);
+  assert.match(repository, /DeletionPolicy: Retain/);
+  assert.match(repository, /UpdateReplacePolicy: Retain/);
+  assert.match(repository, /RepositoryName: !Sub "\$\{MlSummarizerStackName\}-images"/);
+  assert.match(repository, /ImageTagMutability: IMMUTABLE/);
+  assert.match(repository, /EncryptionType: AES256/);
+  assert.match(repository, /ScanOnPush: true/);
+  assert.match(repository, /Service: lambda.amazonaws.com/);
+  assert.match(
+    repository,
+    /aws:SourceArn: !Sub "arn:\$\{AWS::Partition\}:lambda:\$\{AWS::Region\}:\$\{AWS::AccountId\}:function:\$\{MlSummarizerStackName\}-summarize"/,
+  );
+  assert.doesNotMatch(repository, /Principal: ["']?\*|Action: ["']?\*/);
+});
